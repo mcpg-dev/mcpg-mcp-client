@@ -1,6 +1,6 @@
 [package]
 name = "mcpg-mcp-client"
-version = "0.1.0-beta.13"
+version = "0.1.0-beta.14"
 edition = "2024"
 license = "Apache-2.0"
 description = "The MCP client mcpg dials with — both wires, SEP-2575 probe, SSRF-guarded transports"
@@ -9,8 +9,8 @@ description = "The MCP client mcpg dials with — both wires, SEP-2575 probe, SS
 async-stream = "0.3"
 async-trait = "0.1"
 futures = "0.3"
-mcpg-mcp-wire = { git = "https://github.com/mcpg-dev/mcpg-mcp-wire", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
-mcpg-plugin-backend-net-core = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-net-core", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+mcpg-mcp-wire = { git = "https://github.com/mcpg-dev/mcpg-mcp-wire", tag = "v0.1.0-beta.14", version = "=0.1.0-beta.14" }
+mcpg-plugin-backend-net-core = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-net-core", tag = "v0.1.0-beta.14", version = "=0.1.0-beta.14" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 schemars = { version = "0.8", default-features = false, features = ["derive", "preserve_order"] }
 serde = { version = "1", features = ["derive"] }
