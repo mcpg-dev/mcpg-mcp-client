@@ -1,6 +1,6 @@
 [package]
 name = "mcpg-mcp-client"
-version = "0.1.0-beta.30"
+version = "0.1.0-beta.36"
 edition = "2024"
 license = "Apache-2.0"
 description = "The MCP client mcpg dials with — both wires, SEP-2575 probe, SSRF-guarded transports"
@@ -9,10 +9,10 @@ description = "The MCP client mcpg dials with — both wires, SEP-2575 probe, SS
 async-stream = "0.3"
 async-trait = "0.1"
 futures = "0.3"
-mcpg-mcp-wire = { git = "https://github.com/mcpg-dev/mcpg-mcp-wire", tag = "v0.1.0-beta.28", version = "=0.1.0-beta.28" }
-mcpg-plugin-backend-net-core = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-net-core", tag = "v0.1.0-beta.30", version = "=0.1.0-beta.30" }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-schemars = { version = "0.8", default-features = false, features = ["derive", "preserve_order"] }
+mcpg-mcp-wire = { git = "https://github.com/mcpg-dev/mcpg-mcp-wire", tag = "v0.1.0-beta.34", version = "=0.1.0-beta.34" }
+mcpg-plugin-backend-net-core = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-net-core", tag = "v0.1.0-beta.36", version = "=0.1.0-beta.36" }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+schemars = { version = "1.2", default-features = false, features = ["derive", "preserve_order", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.52.3", features = ["full"] }
