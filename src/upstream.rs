@@ -71,6 +71,10 @@ pub enum UpstreamError {
     ResponseTooLarge { limit: u64 },
     /// Upstream returned a JSON-RPC error.
     JsonRpc { code: i64, message: String },
+    /// The upstream credential is minted from a sign-in the caller has not
+    /// stored, so no request was sent. `message` says how to store one, in
+    /// words written for the caller: it names no upstream detail.
+    NotLinked { message: String },
 }
 
 impl fmt::Display for UpstreamError {
@@ -94,6 +98,7 @@ impl fmt::Display for UpstreamError {
             Self::JsonRpc { code, message } => {
                 write!(f, "upstream JSON-RPC error {code}: {message}")
             }
+            Self::NotLinked { message } => write!(f, "no stored sign-in: {message}"),
         }
     }
 }
@@ -1900,6 +1905,19 @@ async fn read_capped(mut resp: reqwest::Response, max: u64) -> Result<String, Up
 
 #[cfg(test)]
 mod tests {
+
+    /// A missing stored sign-in reads as what the caller must do, not as
+    /// a failure to reach the upstream.
+    #[test]
+    fn a_missing_sign_in_says_how_to_store_one() {
+        let error = super::UpstreamError::NotLinked {
+            message: "open https://gw.example/oauth/connect once, then retry".to_owned(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "no stored sign-in: open https://gw.example/oauth/connect once, then retry"
+        );
+    }
 
     /// The typed-array form is what goes on the modern wire, and its order
     /// is what the server echoes back — per-resource watches first, so a

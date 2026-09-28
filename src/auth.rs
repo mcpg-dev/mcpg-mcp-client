@@ -1,7 +1,8 @@
 //! The client half of MCP authorization: reading a `WWW-Authenticate`
 //! challenge, then walking the discovery chain — RFC 9728
 //! protected-resource metadata on the server's own URL, then RFC 8414
-//! authorization-server metadata — to the audience and token endpoint.
+//! authorization-server metadata — to the resource, issuer and token
+//! endpoint.
 //!
 //! Two callers with different needs share it. The gateway wants the
 //! answer, so [`discover_oauth`] returns just that. The inspector wants
@@ -25,6 +26,39 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Cap on a metadata response body.
 const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
+/// ID-JAG §10.2: the grant profile an authorization server lists in
+/// `authorization_grant_profiles_supported` when it redeems ID-JAGs.
+pub const GRANT_PROFILE_ID_JAG: &str = "urn:ietf:params:oauth:grant-profile:id-jag";
+/// RFC 7523 JWT bearer grant, which redeems an ID-JAG.
+pub const GRANT_TYPE_JWT_BEARER: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
+
+/// The grant a credential issuer runs with discovered metadata. It decides
+/// what the per-call `audience` names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialFlow {
+    /// The issued token goes to the resource itself (client credentials,
+    /// RFC 8693 exchange), so `audience` is the resource.
+    Direct,
+    /// ID-JAG: hop 1 asks the IdP for a grant addressed to the upstream
+    /// authorization server, so `audience` is that server's issuer
+    /// (ID-JAG §4.3). The resource travels separately as `resource`.
+    IdJag,
+}
+
+/// How far an authorization server's metadata commits to redeeming ID-JAGs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdJagSupport {
+    /// Lists the id-jag grant profile, and the JWT bearer grant whenever it
+    /// lists grant types at all.
+    Advertised,
+    /// Lists the JWT bearer grant but not the profile. ID-JAG §7.2 only
+    /// recommends the profile, and MCP enterprise-managed authorization
+    /// clients accept the grant alone.
+    JwtBearerOnly,
+    /// Neither, or a grant list that leaves out the JWT bearer grant.
+    Unsupported,
+}
+
 /// Network posture for discovery fetches. Registry upstreams are
 /// TLS-only by construction, so production wiring keeps
 /// `allow_insecure_http` false; tests may relax it for loopback mocks.
@@ -34,13 +68,14 @@ pub struct DiscoveryPolicy {
     pub allow_insecure_http: bool,
 }
 
-/// What discovery yields for one server: the token audience (the
-/// RFC 9728 `resource` identifier) and the AS token endpoint.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What discovery yields for one server: the RFC 9728 `resource`
+/// identifier, the AS issuer and the AS token endpoint.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DiscoveredOauth {
     pub resource: String,
     pub token_endpoint: String,
-    /// The AS issuer, as it validated against the metadata URL.
+    /// The AS issuer exactly as its own metadata states it. An ID-JAG
+    /// `aud` must equal this value byte for byte.
     pub issuer: String,
     /// Where to send the user for an authorization-code grant. Absent on
     /// an AS that only issues tokens machine-to-machine.
@@ -54,16 +89,65 @@ pub struct DiscoveredOauth {
     /// The server accepts a client-metadata-document URL as `client_id`.
     /// A client with a public origin can then skip registration entirely.
     pub client_id_metadata_document_supported: bool,
+    /// RFC 8414 `grant_types_supported`; empty when the AS omits it.
+    pub grant_types_supported: Vec<String>,
+    /// ID-JAG §7.2 `authorization_grant_profiles_supported`; empty when
+    /// the AS omits it.
+    pub authorization_grant_profiles_supported: Vec<String>,
+    /// RFC 8414 `token_endpoint_auth_methods_supported`; empty when the AS
+    /// omits it.
+    pub token_endpoint_auth_methods_supported: Vec<String>,
+    /// RFC 9449 §5.1: the JWS algorithms the AS accepts in a DPoP proof.
+    /// Empty when the AS does not bind tokens to keys.
+    pub dpop_signing_alg_values_supported: Vec<String>,
+    /// RFC 9396 §10: the `authorization_details` types the AS takes.
+    pub authorization_details_types_supported: Vec<String>,
+    /// RFC 9207 §3: the AS sends `iss` in every authorization response.
+    pub authorization_response_iss_parameter_supported: bool,
+    /// RFC 9728 §2 `dpop_signing_alg_values_supported` of the protected
+    /// resource.
+    pub resource_dpop_signing_alg_values_supported: Vec<String>,
+    /// RFC 9728 §2: the protected resource takes only DPoP-bound tokens.
+    pub resource_dpop_bound_access_tokens_required: bool,
+    /// RFC 9728 §2 `authorization_details_types_supported` of the protected
+    /// resource.
+    pub resource_authorization_details_types_supported: Vec<String>,
 }
 
 impl DiscoveredOauth {
-    /// The per-call issuer config the template credential issuers
-    /// consume (`audience` / `resource` / `redeem_token_url`).
-    pub fn into_call_config(self) -> serde_json::Value {
+    /// What the AS metadata says about redeeming ID-JAGs.
+    pub fn id_jag_support(&self) -> IdJagSupport {
+        let profile = self
+            .authorization_grant_profiles_supported
+            .iter()
+            .any(|p| p == GRANT_PROFILE_ID_JAG);
+        let jwt_bearer = self
+            .grant_types_supported
+            .iter()
+            .any(|g| g == GRANT_TYPE_JWT_BEARER);
+        match (profile, jwt_bearer) {
+            (true, true) => IdJagSupport::Advertised,
+            // The profile implies the grant; only a grant list that leaves
+            // it out contradicts the profile.
+            (true, false) if self.grant_types_supported.is_empty() => IdJagSupport::Advertised,
+            (false, true) => IdJagSupport::JwtBearerOnly,
+            _ => IdJagSupport::Unsupported,
+        }
+    }
+
+    /// The per-call config the template credential issuers consume:
+    /// `audience`, `resource`, `redeem_token_url`, and the `issuer` the
+    /// values came from.
+    pub fn into_call_config(self, flow: CredentialFlow) -> serde_json::Value {
+        let audience = match flow {
+            CredentialFlow::Direct => self.resource.clone(),
+            CredentialFlow::IdJag => self.issuer.clone(),
+        };
         serde_json::json!({
-            "audience": self.resource,
+            "audience": audience,
             "resource": self.resource,
             "redeem_token_url": self.token_endpoint,
+            "issuer": self.issuer,
         })
     }
 }
@@ -156,6 +240,12 @@ struct ProtectedResourceMetadata {
     resource: String,
     #[serde(default)]
     authorization_servers: Vec<String>,
+    #[serde(default)]
+    dpop_signing_alg_values_supported: Vec<String>,
+    #[serde(default)]
+    dpop_bound_access_tokens_required: bool,
+    #[serde(default)]
+    authorization_details_types_supported: Vec<String>,
 }
 
 /// RFC 8414 §2 — the subset consumed here.
@@ -177,6 +267,18 @@ struct AuthorizationServerMetadata {
     /// registration step at all.
     #[serde(default)]
     client_id_metadata_document_supported: bool,
+    #[serde(default)]
+    grant_types_supported: Vec<String>,
+    #[serde(default)]
+    authorization_grant_profiles_supported: Vec<String>,
+    #[serde(default)]
+    token_endpoint_auth_methods_supported: Vec<String>,
+    #[serde(default)]
+    dpop_signing_alg_values_supported: Vec<String>,
+    #[serde(default)]
+    authorization_details_types_supported: Vec<String>,
+    #[serde(default)]
+    authorization_response_iss_parameter_supported: bool,
 }
 
 /// Discover the OAuth metadata for one server URL.
@@ -275,6 +377,16 @@ async fn walk(
         scopes_supported: asm.scopes_supported,
         code_challenge_methods_supported: asm.code_challenge_methods_supported,
         client_id_metadata_document_supported: asm.client_id_metadata_document_supported,
+        grant_types_supported: asm.grant_types_supported,
+        authorization_grant_profiles_supported: asm.authorization_grant_profiles_supported,
+        token_endpoint_auth_methods_supported: asm.token_endpoint_auth_methods_supported,
+        dpop_signing_alg_values_supported: asm.dpop_signing_alg_values_supported,
+        authorization_details_types_supported: asm.authorization_details_types_supported,
+        authorization_response_iss_parameter_supported: asm
+            .authorization_response_iss_parameter_supported,
+        resource_dpop_signing_alg_values_supported: rm.dpop_signing_alg_values_supported,
+        resource_dpop_bound_access_tokens_required: rm.dpop_bound_access_tokens_required,
+        resource_authorization_details_types_supported: rm.authorization_details_types_supported,
     })
 }
 
@@ -417,56 +529,260 @@ mod tests {
         );
     }
 
-    /// Serve both metadata documents from one loopback mock and walk
-    /// the full 9728 → 8414 chain.
-    #[tokio::test]
-    async fn discovers_resource_and_token_endpoint() {
+    const LOOPBACK: DiscoveryPolicy = DiscoveryPolicy {
+        allow_private: true,
+        allow_insecure_http: true,
+    };
+
+    /// Serve a protected resource at `{base}/mcp` whose metadata names
+    /// `{base}` as its AS, and the AS metadata `asm(base)`, from one
+    /// loopback listener. Returns `base`.
+    async fn serve_chain(asm: fn(&str) -> serde_json::Value) -> String {
+        serve_chain_with(serde_json::json!({}), asm).await
+    }
+
+    /// [`serve_chain`] with `prm_extra` members added to the protected
+    /// resource metadata.
+    async fn serve_chain_with(
+        prm_extra: serde_json::Value,
+        asm: fn(&str) -> serde_json::Value,
+    ) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let base = format!("http://{addr}");
-        let server_url = format!("{base}/mcp");
-        let rm = {
-            let server_url = server_url.clone();
-            let base = base.clone();
-            move || {
-                let doc = serde_json::json!({
-                    "resource": server_url,
-                    "authorization_servers": [base],
-                });
-                async move { Json(doc) }
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let mut prm = serde_json::json!({
+            "resource": format!("{base}/mcp"),
+            "authorization_servers": [base],
+        });
+        if let serde_json::Value::Object(extra) = prm_extra {
+            for (name, value) in extra {
+                prm[name.as_str()] = value;
             }
-        };
-        let asm = {
-            let base = base.clone();
-            move || {
-                let doc = serde_json::json!({
-                    "issuer": base,
-                    "token_endpoint": format!("{base}/oauth2/token"),
-                });
-                async move { Json(doc) }
-            }
-        };
+        }
+        let asm = asm(&base);
         let app = axum::Router::new()
-            .route("/.well-known/oauth-protected-resource/mcp", get(rm))
-            .route("/.well-known/oauth-authorization-server", get(asm));
+            .route(
+                "/.well-known/oauth-protected-resource/mcp",
+                get(move || {
+                    let doc = prm.clone();
+                    async move { Json(doc) }
+                }),
+            )
+            .route(
+                "/.well-known/oauth-authorization-server",
+                get(move || {
+                    let doc = asm.clone();
+                    async move { Json(doc) }
+                }),
+            );
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
+        base
+    }
 
-        let policy = DiscoveryPolicy {
-            allow_private: true,
-            allow_insecure_http: true,
-        };
-        let d = discover_oauth(&server_url, policy)
+    fn discovered(grant_types: &[&str], profiles: &[&str]) -> DiscoveredOauth {
+        DiscoveredOauth {
+            resource: "https://crm.example/mcp".to_owned(),
+            token_endpoint: "https://as.example/token".to_owned(),
+            issuer: "https://as.example".to_owned(),
+            grant_types_supported: grant_types.iter().map(|s| (*s).to_owned()).collect(),
+            authorization_grant_profiles_supported: profiles
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Walk the full 9728 → 8414 chain. A direct grant addresses the
+    /// token to the resource.
+    #[tokio::test]
+    async fn discovers_resource_and_token_endpoint() {
+        let base = serve_chain(|base| {
+            serde_json::json!({
+                "issuer": base,
+                "token_endpoint": format!("{base}/oauth2/token"),
+            })
+        })
+        .await;
+        let server_url = format!("{base}/mcp");
+        let d = discover_oauth(&server_url, LOOPBACK)
             .await
             .expect("discovers");
         assert_eq!(d.resource, server_url);
+        assert_eq!(d.issuer, base);
         assert_eq!(d.token_endpoint, format!("{base}/oauth2/token"));
-        let cfg = d.into_call_config();
+        assert!(d.grant_types_supported.is_empty());
+        assert!(d.authorization_grant_profiles_supported.is_empty());
+        assert_eq!(d.id_jag_support(), IdJagSupport::Unsupported);
+        let cfg = d.into_call_config(CredentialFlow::Direct);
         assert_eq!(cfg["audience"], serde_json::json!(server_url));
+        assert_eq!(cfg["resource"], serde_json::json!(server_url));
+        assert_eq!(cfg["issuer"], serde_json::json!(base));
         assert_eq!(
             cfg["redeem_token_url"],
             serde_json::json!(format!("{base}/oauth2/token"))
+        );
+    }
+
+    /// ID-JAG §4.3: hop 1's audience is the AS issuer, not the resource.
+    /// With the resource on a path below the issuer (an mcpg upstream),
+    /// the two differ and an AS that checks `aud == issuer` refuses the
+    /// resource.
+    #[tokio::test]
+    async fn id_jag_call_config_addresses_the_authorization_server() {
+        let base = serve_chain(|base| {
+            serde_json::json!({
+                "issuer": base,
+                "token_endpoint": format!("{base}/oauth/token"),
+                "grant_types_supported": [GRANT_TYPE_JWT_BEARER],
+                "authorization_grant_profiles_supported": [GRANT_PROFILE_ID_JAG],
+            })
+        })
+        .await;
+        let server_url = format!("{base}/mcp");
+        let d = discover_oauth(&server_url, LOOPBACK)
+            .await
+            .expect("discovers");
+        assert_eq!(d.grant_types_supported, vec![GRANT_TYPE_JWT_BEARER]);
+        assert_eq!(
+            d.authorization_grant_profiles_supported,
+            vec![GRANT_PROFILE_ID_JAG]
+        );
+        assert_eq!(d.id_jag_support(), IdJagSupport::Advertised);
+        let cfg = d.into_call_config(CredentialFlow::IdJag);
+        assert_eq!(cfg["audience"], serde_json::json!(base));
+        assert_eq!(cfg["issuer"], serde_json::json!(base));
+        assert_eq!(cfg["resource"], serde_json::json!(server_url));
+        assert_eq!(
+            cfg["redeem_token_url"],
+            serde_json::json!(format!("{base}/oauth/token"))
+        );
+    }
+
+    /// The audience is the issuer the AS states, not the protected
+    /// resource's spelling of it: the AS compares `aud` byte for byte
+    /// against its own issuer.
+    #[tokio::test]
+    async fn id_jag_audience_is_the_issuer_as_the_as_states_it() {
+        let base = serve_chain(|base| {
+            serde_json::json!({
+                "issuer": format!("{base}/"),
+                "token_endpoint": format!("{base}/oauth/token"),
+                "authorization_grant_profiles_supported": [GRANT_PROFILE_ID_JAG],
+            })
+        })
+        .await;
+        let d = discover_oauth(&format!("{base}/mcp"), LOOPBACK)
+            .await
+            .expect("discovers");
+        let cfg = d.into_call_config(CredentialFlow::IdJag);
+        assert_eq!(cfg["audience"], serde_json::json!(format!("{base}/")));
+    }
+
+    /// Sender constraint (RFC 9449), rich authorization requests (RFC 9396),
+    /// client authentication methods and the RFC 9207 `iss` promise are read
+    /// from both documents; the resource's values are kept apart from the
+    /// authorization server's.
+    #[tokio::test]
+    async fn discovers_dpop_rar_and_client_auth_metadata() {
+        let base = serve_chain_with(
+            serde_json::json!({
+                "dpop_signing_alg_values_supported": ["ES256"],
+                "dpop_bound_access_tokens_required": true,
+                "authorization_details_types_supported": ["crm_record"],
+            }),
+            |base| {
+                serde_json::json!({
+                    "issuer": base,
+                    "token_endpoint": format!("{base}/oauth/token"),
+                    "token_endpoint_auth_methods_supported": ["private_key_jwt", "none"],
+                    "dpop_signing_alg_values_supported": ["ES256", "EdDSA"],
+                    "authorization_details_types_supported": ["crm_record", "payment"],
+                    "authorization_response_iss_parameter_supported": true,
+                })
+            },
+        )
+        .await;
+        let d = discover_oauth(&format!("{base}/mcp"), LOOPBACK)
+            .await
+            .expect("discovers");
+        assert_eq!(
+            d.token_endpoint_auth_methods_supported,
+            vec!["private_key_jwt", "none"]
+        );
+        assert_eq!(d.dpop_signing_alg_values_supported, vec!["ES256", "EdDSA"]);
+        assert_eq!(
+            d.authorization_details_types_supported,
+            vec!["crm_record", "payment"]
+        );
+        assert!(d.authorization_response_iss_parameter_supported);
+        assert_eq!(d.resource_dpop_signing_alg_values_supported, vec!["ES256"]);
+        assert!(d.resource_dpop_bound_access_tokens_required);
+        assert_eq!(
+            d.resource_authorization_details_types_supported,
+            vec!["crm_record"]
+        );
+    }
+
+    /// Absent members read as absent, not as refusals.
+    #[tokio::test]
+    async fn missing_dpop_and_rar_metadata_reads_as_empty() {
+        let base = serve_chain(|base| {
+            serde_json::json!({
+                "issuer": base,
+                "token_endpoint": format!("{base}/oauth/token"),
+            })
+        })
+        .await;
+        let d = discover_oauth(&format!("{base}/mcp"), LOOPBACK)
+            .await
+            .expect("discovers");
+        assert!(d.token_endpoint_auth_methods_supported.is_empty());
+        assert!(d.dpop_signing_alg_values_supported.is_empty());
+        assert!(d.authorization_details_types_supported.is_empty());
+        assert!(!d.authorization_response_iss_parameter_supported);
+        assert!(!d.resource_dpop_bound_access_tokens_required);
+    }
+
+    #[test]
+    fn id_jag_support_reads_the_profile_and_the_grant_list() {
+        let other = "urn:ietf:params:oauth:grant-profile:other";
+        // The profile alone: grant types omitted are not held against it.
+        assert_eq!(
+            discovered(&[], &[GRANT_PROFILE_ID_JAG]).id_jag_support(),
+            IdJagSupport::Advertised
+        );
+        assert_eq!(
+            discovered(
+                &["authorization_code", GRANT_TYPE_JWT_BEARER],
+                &[other, GRANT_PROFILE_ID_JAG]
+            )
+            .id_jag_support(),
+            IdJagSupport::Advertised
+        );
+        // The grant without the profile, which the profile only recommends.
+        assert_eq!(
+            discovered(&[GRANT_TYPE_JWT_BEARER], &[]).id_jag_support(),
+            IdJagSupport::JwtBearerOnly
+        );
+        assert_eq!(
+            discovered(&["authorization_code", GRANT_TYPE_JWT_BEARER], &[other]).id_jag_support(),
+            IdJagSupport::JwtBearerOnly
+        );
+        // Profile, but a grant list that leaves out jwt-bearer: hop 2
+        // would be refused, so the metadata does not count as support.
+        assert_eq!(
+            discovered(&["client_credentials"], &[GRANT_PROFILE_ID_JAG]).id_jag_support(),
+            IdJagSupport::Unsupported
+        );
+        assert_eq!(
+            discovered(&["authorization_code"], &[other]).id_jag_support(),
+            IdJagSupport::Unsupported
+        );
+        assert_eq!(
+            discovered(&[], &[]).id_jag_support(),
+            IdJagSupport::Unsupported
         );
     }
 
