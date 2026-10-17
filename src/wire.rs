@@ -58,6 +58,11 @@ pub struct JsonRpcResponse {
 pub struct JsonRpcError {
     pub code: i64,
     pub message: String,
+    /// The typed detail a code carries (e.g. `{kind}` on an Events
+    /// `-32011`, `{limit, max}` on `-32013`). Kept so a caller can tell the
+    /// conditions one code spans apart.
+    #[serde(default)]
+    pub data: Option<Value>,
 }
 
 /// An upstream tool descriptor (MCP wire shape). Maps onto the
@@ -245,6 +250,23 @@ mod tests {
         let err = resp.error.unwrap();
         assert_eq!(err.code, -32601);
         assert_eq!(err.message, "no such method");
+        assert_eq!(err.data, None);
+    }
+
+    #[test]
+    fn parse_error_keeps_data() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32013,"message":"limit reached","data":{"limit":"subscriptions","max":100}}}"#;
+        let err = parse_jsonrpc_body(false, body).unwrap().error.unwrap();
+        assert_eq!(err.code, -32013);
+        assert_eq!(
+            err.data,
+            Some(json!({ "limit": "subscriptions", "max": 100 }))
+        );
+
+        let sse = "event: message\n\
+                   data: {\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32011,\"message\":\"x\",\"data\":{\"kind\":\"event\"}}}\n\n";
+        let err = parse_jsonrpc_body(true, sse).unwrap().error.unwrap();
+        assert_eq!(err.data, Some(json!({ "kind": "event" })));
     }
 
     #[test]

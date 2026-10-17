@@ -17,7 +17,9 @@ pub enum FrameDirection {
 /// The channel a frame was observed on. `HttpResponse` is a buffered
 /// body (plain JSON, or the full text of a per-request SSE stream);
 /// `HttpSse` is one raw SSE event block — including its `event:` /
-/// `id:` field lines — from a live stream.
+/// `id:` field lines — from a live stream. `Webhook` is the body of a
+/// POST the server sent to a callback of this client: an MCP Events
+/// delivery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameChannel {
     HttpRequest,
@@ -25,6 +27,7 @@ pub enum FrameChannel {
     HttpSse,
     Stdio,
     StdioStderr,
+    Webhook,
 }
 
 impl FrameDirection {
@@ -44,6 +47,7 @@ impl FrameChannel {
             Self::HttpSse => "http-sse",
             Self::Stdio => "stdio",
             Self::StdioStderr => "stdio-stderr",
+            Self::Webhook => "webhook",
         }
     }
 }

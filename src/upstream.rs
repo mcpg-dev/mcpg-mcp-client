@@ -21,6 +21,7 @@ use crate::wire::{
     self, JsonRpcRequest, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
     ListToolsResult, UpstreamPrompt, UpstreamResource, UpstreamResourceTemplate, UpstreamTool,
 };
+use mcpg_mcp_wire::v_2026_07_28::extensions::events::wire as events;
 use mcpg_plugin_backend_net_core::safe_dns;
 
 /// MCP protocol version MCPG advertises as a client on the legacy
@@ -47,6 +48,22 @@ const MODERN_FEDERATION_PROTOCOL_VERSION: &str =
 const VIA_HEADER: &str = "mcpg-upstream-via";
 /// Defensive cap on imported tools from a single upstream.
 const MAX_IMPORTED_TOOLS: usize = 10_000;
+/// Defensive cap on the MCP Events types one `events/list` walk reads.
+const MAX_LISTED_EVENT_TYPES: usize = 10_000;
+/// Silence after which a long-lived stream is closed for the caller to
+/// reopen: twice the heartbeat ceiling of an MCP Events push stream
+/// ([`events::MAX_STREAM_HEARTBEAT_MS`]), and four times the 15 s keep-alive
+/// mcpg's own SSE streams send.
+pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration =
+    Duration::from_millis(2 * events::MAX_STREAM_HEARTBEAT_MS);
+
+/// The `capabilities` object of a handshake result, when it has one.
+fn capabilities_of(result: Option<Value>) -> Option<Value> {
+    result?
+        .get("capabilities")
+        .filter(|capabilities| capabilities.is_object())
+        .cloned()
+}
 
 /// Failure modes of an upstream MCP call.
 #[derive(Debug)]
@@ -56,12 +73,12 @@ pub enum UpstreamError {
     /// Transport-level failure (network, body read).
     Transport(String),
     /// Non-2xx HTTP response on a POST. Carries the status and, when the
-    /// body held a JSON-RPC error, its code — the wire-version probe uses
-    /// these to tell "legacy peer rejecting a modern method" from a real
-    /// failure.
+    /// body held one, the JSON-RPC error: a 2026-07-28 server answers an
+    /// error with the status its code maps to, so the error is the answer
+    /// and the status only how it travelled.
     Http {
         status: u16,
-        jsonrpc_code: Option<i64>,
+        error: Option<wire::JsonRpcError>,
     },
     /// Malformed / unexpected protocol payload.
     Protocol(String),
@@ -69,12 +86,22 @@ pub enum UpstreamError {
     Rebinding(String),
     /// Upstream response exceeded the configured byte cap.
     ResponseTooLarge { limit: u64 },
-    /// Upstream returned a JSON-RPC error.
-    JsonRpc { code: i64, message: String },
+    /// Upstream returned a JSON-RPC error. `data` is the error's `data`
+    /// member, kept verbatim; it is the upstream's text, so it is not part
+    /// of the `Display` form.
+    JsonRpc {
+        code: i64,
+        message: String,
+        data: Option<Value>,
+    },
     /// The upstream credential is minted from a sign-in the caller has not
     /// stored, so no request was sent. `message` says how to store one, in
     /// words written for the caller: it names no upstream detail.
     NotLinked { message: String },
+    /// The method is not served on this transport or wire, so no request
+    /// was sent: MCP Events, for example, exists only on 2026-07-28 over
+    /// HTTP.
+    Unsupported(&'static str),
 }
 
 impl fmt::Display for UpstreamError {
@@ -84,26 +111,85 @@ impl fmt::Display for UpstreamError {
             Self::Transport(m) => write!(f, "upstream transport error: {m}"),
             Self::Http {
                 status,
-                jsonrpc_code: Some(code),
-            } => write!(f, "upstream returned HTTP {status} (JSON-RPC error {code})"),
+                error: Some(error),
+            } => write!(
+                f,
+                "upstream returned HTTP {status} (JSON-RPC error {}: {})",
+                error.code, error.message
+            ),
             Self::Http {
                 status,
-                jsonrpc_code: None,
+                error: None,
             } => write!(f, "upstream returned HTTP {status}"),
             Self::Protocol(m) => write!(f, "upstream protocol error: {m}"),
             Self::Rebinding(m) => write!(f, "upstream blocked by DNS-rebinding guard: {m}"),
             Self::ResponseTooLarge { limit } => {
                 write!(f, "upstream response exceeded {limit} bytes")
             }
-            Self::JsonRpc { code, message } => {
+            Self::JsonRpc { code, message, .. } => {
                 write!(f, "upstream JSON-RPC error {code}: {message}")
             }
             Self::NotLinked { message } => write!(f, "no stored sign-in: {message}"),
+            Self::Unsupported(method) => {
+                write!(
+                    f,
+                    "{method} is not served on this upstream's transport or wire"
+                )
+            }
         }
     }
 }
 
 impl std::error::Error for UpstreamError {}
+
+impl From<wire::JsonRpcError> for UpstreamError {
+    fn from(err: wire::JsonRpcError) -> Self {
+        Self::JsonRpc {
+            code: err.code,
+            message: err.message,
+            data: err.data,
+        }
+    }
+}
+
+impl UpstreamError {
+    /// A JSON-RPC `error` member read off a raw frame. A malformed member
+    /// still yields an error (`-32603`), never a success.
+    fn from_error_value(err: &Value) -> Self {
+        Self::JsonRpc {
+            code: err.get("code").and_then(Value::as_i64).unwrap_or(-32603),
+            message: err
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("upstream error")
+                .to_owned(),
+            data: err.get("data").cloned(),
+        }
+    }
+
+    /// The code of the JSON-RPC error the upstream answered with, in a
+    /// success body or with an error status.
+    pub fn jsonrpc_code(&self) -> Option<i64> {
+        match self {
+            Self::JsonRpc { code, .. } => Some(*code),
+            Self::Http {
+                error: Some(error), ..
+            } => Some(error.code),
+            _ => None,
+        }
+    }
+
+    /// The `data` of that JSON-RPC error, when it carried any.
+    pub fn jsonrpc_data(&self) -> Option<&Value> {
+        match self {
+            Self::JsonRpc { data, .. } => data.as_ref(),
+            Self::Http {
+                error: Some(error), ..
+            } => error.data.as_ref(),
+            _ => None,
+        }
+    }
+}
 
 /// Connection parameters for a single upstream session.
 #[derive(Clone)]
@@ -182,17 +268,22 @@ pub struct SubscriptionSpec {
     pub tools_list_changed: bool,
     pub prompts_list_changed: bool,
     pub resources_list_changed: bool,
+    /// MCP Events type changes (`notifications/events/list_changed`). An
+    /// extension: ask only an upstream that advertises events. The legacy
+    /// wire has no events, so it ignores this.
+    pub events_list_changed: bool,
 }
 
 impl SubscriptionSpec {
-    /// Every catalog change, no per-resource watches. What a UI wants when
-    /// it is showing lists and nothing more specific.
+    /// Every core catalog change, no per-resource watches. What a UI wants
+    /// when it is showing lists and nothing more specific.
     pub fn all_list_changed() -> Self {
         Self {
             resource_uris: Vec::new(),
             tools_list_changed: true,
             prompts_list_changed: true,
             resources_list_changed: true,
+            events_list_changed: false,
         }
     }
 
@@ -201,6 +292,7 @@ impl SubscriptionSpec {
             && !self.tools_list_changed
             && !self.prompts_list_changed
             && !self.resources_list_changed
+            && !self.events_list_changed
     }
 
     /// The modern wire's typed-array form.
@@ -218,6 +310,9 @@ impl SubscriptionSpec {
         }
         if self.resources_list_changed {
             out.push(SubscriptionTarget::ResourcesListChanged);
+        }
+        if self.events_list_changed {
+            out.push(SubscriptionTarget::EventsListChanged);
         }
         out
     }
@@ -317,12 +412,64 @@ pub trait McpUpstream: Send + Sync {
         spec: &SubscriptionSpec,
     ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Value> + Send>>, UpstreamError>;
 
+    /// `events/list`, every page. MCP Events exists on the 2026-07-28 wire
+    /// over HTTP only; elsewhere [`UpstreamError::Unsupported`].
+    async fn list_events(&self) -> Result<Vec<events::EventDescriptor>, UpstreamError> {
+        Err(UpstreamError::Unsupported(events::METHOD_LIST_EVENTS))
+    }
+
+    /// `events/poll`.
+    async fn poll_events(
+        &self,
+        _params: &events::PollEventsParams,
+    ) -> Result<events::PollEventsResult, UpstreamError> {
+        Err(UpstreamError::Unsupported(events::METHOD_POLL_EVENTS))
+    }
+
+    /// `events/stream`: the stream's notifications as they arrive. The
+    /// stream ends when the upstream closes it, or after the stream idle
+    /// timeout without a byte (a live stream heartbeats well inside it).
+    async fn open_event_stream(
+        &self,
+        _params: &events::StreamEventsParams,
+    ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Value> + Send>>, UpstreamError> {
+        Err(UpstreamError::Unsupported(events::METHOD_STREAM_EVENTS))
+    }
+
+    /// `events/subscribe`: create or refresh a webhook subscription.
+    async fn subscribe_events(
+        &self,
+        _params: &events::SubscribeEventsParams,
+    ) -> Result<events::SubscribeEventsResult, UpstreamError> {
+        Err(UpstreamError::Unsupported(events::METHOD_SUBSCRIBE_EVENTS))
+    }
+
+    /// `events/unsubscribe`.
+    async fn unsubscribe_events(
+        &self,
+        _params: &events::UnsubscribeEventsParams,
+    ) -> Result<events::UnsubscribeEventsResult, UpstreamError> {
+        Err(UpstreamError::Unsupported(
+            events::METHOD_UNSUBSCRIBE_EVENTS,
+        ))
+    }
+
     /// The wire actually spoken to this upstream. Differs from the
     /// configured hint when connect probed (`protocol_version: auto`);
     /// the engine caches it per federation so later connects skip the
     /// probe.
     fn wire_is_modern(&self) -> bool {
         false
+    }
+
+    /// The `capabilities` object the upstream advertised at connect: the
+    /// `server/discover` result's on the modern wire, the `initialize`
+    /// result's on the legacy one. `None` when connect exchanged neither —
+    /// a wire pinned to `2026-07-28` without probing sends no handshake.
+    /// Kept verbatim, so an extension's entry reaches whoever reads it by
+    /// type (MCP Events: `EventsCapability::advertised_in`).
+    fn server_capabilities(&self) -> Option<&Value> {
+        None
     }
 
     async fn close(&self);
@@ -350,7 +497,16 @@ pub struct StreamableHttpUpstream {
     modern: bool,
     /// Captured from the `initialize` response's `Mcp-Session-Id`.
     session_id: Option<String>,
+    /// The connect handshake's advertised `capabilities`.
+    server_capabilities: Option<Value>,
     next_id: AtomicU64,
+    /// How long a long-lived stream may stay silent before it is closed
+    /// and the caller reconnects.
+    stream_idle_timeout: Duration,
+    /// The client for long-lived streams: same pinned address and
+    /// redirect policy as `client`, but no total-request timeout, which
+    /// would cut every stream at `opts.timeout`.
+    stream_client: reqwest::Client,
 }
 
 impl StreamableHttpUpstream {
@@ -362,13 +518,16 @@ impl StreamableHttpUpstream {
     /// `opts.probe`, the wire is detected first (`server/discover`, then
     /// the legacy fallback).
     pub async fn connect(opts: UpstreamConnectOptions) -> Result<Self, UpstreamError> {
-        let client = build_guarded_client(&opts).await?;
+        let (client, stream_client) = build_guarded_clients(&opts).await?;
         let mut upstream = Self {
             client,
             modern: opts.modern,
             opts,
             session_id: None,
+            server_capabilities: None,
             next_id: AtomicU64::new(1),
+            stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
+            stream_client,
         };
         if upstream.opts.probe {
             upstream.probe_wire().await?;
@@ -399,7 +558,10 @@ impl StreamableHttpUpstream {
             )
             .await
         {
-            Ok(_) => Ok(()),
+            Ok((result, _)) => {
+                self.server_capabilities = capabilities_of(result);
+                Ok(())
+            }
             Err(e) if probe_indicates_legacy(&e) => {
                 self.modern = false;
                 self.initialize().await
@@ -449,10 +611,11 @@ impl StreamableHttpUpstream {
             "capabilities": self.opts.client_capabilities.clone(),
             "clientInfo": { "name": wire::CLIENT_NAME, "version": env!("CARGO_PKG_VERSION") },
         });
-        let (_result, session) = self
+        let (result, session) = self
             .post(&JsonRpcRequest::call(id, "initialize", Some(params)), false)
             .await?;
         self.session_id = session;
+        self.server_capabilities = capabilities_of(result);
         // Strict version negotiation is a follow-up; the client accepts
         // the upstream's `initialize` result as-is.
         self.post(
@@ -465,6 +628,14 @@ impl StreamableHttpUpstream {
 
     fn next_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Close a long-lived stream after `idle` without a byte from the
+    /// upstream, in place of [`DEFAULT_STREAM_IDLE_TIMEOUT`].
+    #[cfg(test)]
+    fn with_stream_idle_timeout(mut self, idle: Duration) -> Self {
+        self.stream_idle_timeout = idle;
+        self
     }
 
     /// Send one JSON-RPC message. Returns `(result, session_id_header)`.
@@ -536,10 +707,7 @@ impl StreamableHttpUpstream {
         );
         let parsed = wire::parse_jsonrpc_body(is_sse, &text).map_err(UpstreamError::Protocol)?;
         if let Some(err) = parsed.error {
-            return Err(UpstreamError::JsonRpc {
-                code: err.code,
-                message: err.message,
-            });
+            return Err(err.into());
         }
         Ok((parsed.result, session))
     }
@@ -571,8 +739,39 @@ impl StreamableHttpUpstream {
         after_init: bool,
         extra_headers: &[(String, String)],
     ) -> Result<reqwest::Response, UpstreamError> {
-        let mut req = self
-            .client
+        self.send_post_via(&self.client, body, after_init, extra_headers)
+            .await
+    }
+
+    /// As [`send_post_with_headers`], for a request that opens a
+    /// long-lived stream: no end-to-end deadline on the body, but the
+    /// response head must still arrive within `opts.timeout`.
+    async fn send_stream_post<B: serde::Serialize + ?Sized>(
+        &self,
+        body: &B,
+        extra_headers: &[(String, String)],
+    ) -> Result<reqwest::Response, UpstreamError> {
+        tokio::time::timeout(
+            self.opts.timeout,
+            self.send_post_via(&self.stream_client, body, true, extra_headers),
+        )
+        .await
+        .map_err(|_| {
+            UpstreamError::Transport(format!(
+                "stream request to {} timed out waiting for a response",
+                self.opts.url
+            ))
+        })?
+    }
+
+    async fn send_post_via<B: serde::Serialize + ?Sized>(
+        &self,
+        client: &reqwest::Client,
+        body: &B,
+        after_init: bool,
+        extra_headers: &[(String, String)],
+    ) -> Result<reqwest::Response, UpstreamError> {
+        let mut req = client
             .post(&self.opts.url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(
@@ -654,10 +853,10 @@ impl StreamableHttpUpstream {
         })?;
         let status = resp.status();
         if !status.is_success() {
-            // Surface the JSON-RPC error code when the error body carries
-            // one (e.g. 400 + `-32022` unsupported protocol version) so
-            // the wire probe can classify the rejection.
-            let jsonrpc_code = match read_capped(resp, self.opts.max_response_bytes).await {
+            // The JSON-RPC error the body carries, whole: its code is what
+            // the wire probe classifies (400 + `-32022`), and its `data` is
+            // what a caller tells one condition of a code from another by.
+            let error = match read_capped(resp, self.opts.max_response_bytes).await {
                 Ok(text) => {
                     tap_frame(
                         &self.opts.tap,
@@ -667,13 +866,14 @@ impl StreamableHttpUpstream {
                     );
                     serde_json::from_str::<Value>(&text)
                         .ok()
-                        .and_then(|v| v.get("error")?.get("code")?.as_i64())
+                        .and_then(|mut v| v.get_mut("error").map(Value::take))
+                        .and_then(|e| serde_json::from_value::<wire::JsonRpcError>(e).ok())
                 }
                 Err(_) => None,
             };
             return Err(UpstreamError::Http {
                 status: status.as_u16(),
-                jsonrpc_code,
+                error,
             });
         }
         Ok(resp)
@@ -795,10 +995,7 @@ impl StreamableHttpUpstream {
             );
             let parsed = wire::parse_jsonrpc_body(false, &text).map_err(UpstreamError::Protocol)?;
             if let Some(err) = parsed.error {
-                return Err(UpstreamError::JsonRpc {
-                    code: err.code,
-                    message: err.message,
-                });
+                return Err(err.into());
             }
             return parsed
                 .result
@@ -821,14 +1018,7 @@ impl StreamableHttpUpstream {
                 // Terminal response to our request (has id, no method).
                 (None, Some(_)) => {
                     if let Some(err) = msg.get("error") {
-                        return Err(UpstreamError::JsonRpc {
-                            code: err.get("code").and_then(Value::as_i64).unwrap_or(-32603),
-                            message: err
-                                .get("message")
-                                .and_then(Value::as_str)
-                                .unwrap_or("upstream error")
-                                .to_owned(),
-                        });
+                        return Err(UpstreamError::from_error_value(err));
                     }
                     return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
                 }
@@ -902,13 +1092,24 @@ impl StreamableHttpUpstream {
         // federation for the lifetime of a stream, not once per call.
         let signed = self.sign_headers("GET", None, &headers)?;
         headers.extend(signed);
-        let mut req = self.client.get(&self.opts.url);
+        let mut req = self.stream_client.get(&self.opts.url);
         for (name, value) in &headers {
             req = req.header(name.as_str(), value.as_str());
         }
-        let resp = req.send().await.map_err(|e| {
-            UpstreamError::Transport(format!("notification GET to {} failed: {e}", self.opts.url))
-        })?;
+        let resp = tokio::time::timeout(self.opts.timeout, req.send())
+            .await
+            .map_err(|_| {
+                UpstreamError::Transport(format!(
+                    "notification GET to {} timed out waiting for a response",
+                    self.opts.url
+                ))
+            })?
+            .map_err(|e| {
+                UpstreamError::Transport(format!(
+                    "notification GET to {} failed: {e}",
+                    self.opts.url
+                ))
+            })?;
         if !resp.status().is_success() {
             return Err(UpstreamError::Transport(format!(
                 "notification stream returned HTTP {}",
@@ -918,6 +1119,7 @@ impl StreamableHttpUpstream {
         Ok(notification_stream(
             resp,
             self.opts.max_response_bytes,
+            self.stream_idle_timeout,
             self.opts.tap.clone(),
         ))
     }
@@ -949,37 +1151,71 @@ impl StreamableHttpUpstream {
             subscriptions: spec.targets(),
             meta: None,
         };
-        let mut params = serde_json::to_value(&params)
+        let params = serde_json::to_value(&params)
             .map_err(|e| UpstreamError::Protocol(format!("listen params serialize: {e}")))?;
+        self.open_stream_request(METHOD_SUBSCRIPTIONS_LISTEN, params)
+            .await
+    }
+
+    /// A long-lived modern request (`subscriptions/listen`,
+    /// `events/stream`): its notifications as they arrive. A JSON answer
+    /// instead of a stream is the server refusing the request.
+    async fn open_stream_request(
+        &self,
+        method: &'static str,
+        mut params: Value,
+    ) -> Result<impl futures::Stream<Item = Value> + Send + use<>, UpstreamError> {
         self.inject_modern_meta(&mut params);
-        let headers = self.modern_routing_headers(METHOD_SUBSCRIPTIONS_LISTEN, &params, None);
+        let headers = self.modern_routing_headers(method, &params, None);
         let id = self.next_id();
         let resp = self
-            .send_post_with_headers(
-                &JsonRpcRequest::call(id, METHOD_SUBSCRIPTIONS_LISTEN, Some(params)),
-                true,
-                &headers,
-            )
+            .send_stream_post(&JsonRpcRequest::call(id, method, Some(params)), &headers)
             .await?;
         if !is_event_stream(&resp) {
-            // A JSON body is the server declining the stream.
-            let text = read_capped(resp, self.opts.max_response_bytes).await?;
+            // The stream client has no body deadline, so this read gets one.
+            let text = tokio::time::timeout(
+                self.opts.timeout,
+                read_capped(resp, self.opts.max_response_bytes),
+            )
+            .await
+            .map_err(|_| UpstreamError::Transport(format!("{method} refusal body timed out")))??;
             let parsed = wire::parse_jsonrpc_body(false, &text).map_err(UpstreamError::Protocol)?;
             return Err(match parsed.error {
-                Some(err) => UpstreamError::JsonRpc {
-                    code: err.code,
-                    message: err.message,
-                },
-                None => {
-                    UpstreamError::Protocol("subscriptions/listen did not open a stream".into())
-                }
+                Some(err) => err.into(),
+                None => UpstreamError::Protocol(format!("{method} did not open a stream")),
             });
         }
         Ok(notification_stream(
             resp,
             self.opts.max_response_bytes,
+            self.stream_idle_timeout,
             self.opts.tap.clone(),
         ))
+    }
+
+    /// One finite modern request and its typed result. MCP Events and the
+    /// other 2026-07-28-only methods answer [`UpstreamError::Unsupported`]
+    /// on a legacy connection without sending anything.
+    async fn modern_call<P, R>(&self, method: &'static str, params: &P) -> Result<R, UpstreamError>
+    where
+        P: serde::Serialize + ?Sized,
+        R: serde::de::DeserializeOwned,
+    {
+        if !self.modern {
+            return Err(UpstreamError::Unsupported(method));
+        }
+        let params = serde_json::to_value(params)
+            .map_err(|e| UpstreamError::Protocol(format!("{method} params serialize: {e}")))?;
+        let (result, _) = self
+            .post(
+                &JsonRpcRequest::call(self.next_id(), method, Some(params)),
+                true,
+            )
+            .await?;
+        let result = result
+            .ok_or_else(|| UpstreamError::Protocol(format!("{method} returned no result")))?;
+        serde_json::from_value(result)
+            .map_err(|e| UpstreamError::Protocol(format!("{method} result: {e}")))
     }
 }
 
@@ -989,9 +1225,15 @@ impl StreamableHttpUpstream {
 /// frames on `\n\n`, and surface only notifications (object with `method`,
 /// no `id`). A frame buffer that grows past 4× the response cap without a
 /// boundary aborts the stream (defensive against a non-framing upstream).
+///
+/// The stream also ends when `idle` passes without a byte. Heartbeats and
+/// SSE comment keep-alives count as bytes, so a live stream never trips
+/// it, while a silently dead connection ends instead of hanging; either
+/// way the caller reconnects.
 fn notification_stream(
     mut resp: reqwest::Response,
     max_response_bytes: u64,
+    idle: Duration,
     tap: Option<crate::tap::SharedTap>,
 ) -> impl futures::Stream<Item = Value> + Send + use<> {
     let cap = max_response_bytes.saturating_mul(4);
@@ -1002,7 +1244,7 @@ fn notification_stream(
         // Bytes already searched. Only the trailing `needle.len() - 1` bytes
         // can start a delimiter that completes in the next chunk.
         let mut scanned = 0usize;
-        while let Ok(Some(chunk)) = resp.chunk().await {
+        while let Ok(Ok(Some(chunk))) = tokio::time::timeout(idle, resp.chunk()).await {
             buf.extend_from_slice(&chunk);
             if buf.len() as u64 > cap {
                 break;
@@ -1408,8 +1650,78 @@ impl McpUpstream for StreamableHttpUpstream {
         Ok(Box::pin(self.open_notifications_stream().await?))
     }
 
+    async fn list_events(&self) -> Result<Vec<events::EventDescriptor>, UpstreamError> {
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let params = events::ListEventsParams {
+                cursor: cursor.clone(),
+                meta: None,
+            };
+            let page: events::ListEventsResult = self
+                .modern_call(events::METHOD_LIST_EVENTS, &params)
+                .await?;
+            all.extend(page.events);
+            if all.len() > MAX_LISTED_EVENT_TYPES {
+                return Err(UpstreamError::Protocol(format!(
+                    "upstream listed more than {MAX_LISTED_EVENT_TYPES} event types"
+                )));
+            }
+            // A server that hands back the cursor it was given ends the walk
+            // rather than looping.
+            match page.next_cursor {
+                Some(next) if !next.is_empty() && cursor.as_deref() != Some(next.as_str()) => {
+                    cursor = Some(next);
+                }
+                _ => return Ok(all),
+            }
+        }
+    }
+
+    async fn poll_events(
+        &self,
+        params: &events::PollEventsParams,
+    ) -> Result<events::PollEventsResult, UpstreamError> {
+        self.modern_call(events::METHOD_POLL_EVENTS, params).await
+    }
+
+    async fn open_event_stream(
+        &self,
+        params: &events::StreamEventsParams,
+    ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Value> + Send>>, UpstreamError> {
+        if !self.modern {
+            return Err(UpstreamError::Unsupported(events::METHOD_STREAM_EVENTS));
+        }
+        let params = serde_json::to_value(params)
+            .map_err(|e| UpstreamError::Protocol(format!("events/stream params serialize: {e}")))?;
+        Ok(Box::pin(
+            self.open_stream_request(events::METHOD_STREAM_EVENTS, params)
+                .await?,
+        ))
+    }
+
+    async fn subscribe_events(
+        &self,
+        params: &events::SubscribeEventsParams,
+    ) -> Result<events::SubscribeEventsResult, UpstreamError> {
+        self.modern_call(events::METHOD_SUBSCRIBE_EVENTS, params)
+            .await
+    }
+
+    async fn unsubscribe_events(
+        &self,
+        params: &events::UnsubscribeEventsParams,
+    ) -> Result<events::UnsubscribeEventsResult, UpstreamError> {
+        self.modern_call(events::METHOD_UNSUBSCRIBE_EVENTS, params)
+            .await
+    }
+
     fn wire_is_modern(&self) -> bool {
         self.modern
+    }
+
+    fn server_capabilities(&self) -> Option<&Value> {
+        self.server_capabilities.as_ref()
     }
 
     async fn close(&self) {
@@ -1453,6 +1765,8 @@ pub struct StdioUpstream {
     opts: UpstreamConnectOptions,
     next_id: AtomicU64,
     io: tokio::sync::Mutex<StdioIo>,
+    /// The `initialize` result's advertised `capabilities`.
+    server_capabilities: std::sync::OnceLock<Value>,
 }
 
 struct StdioIo {
@@ -1515,6 +1829,7 @@ impl StdioUpstream {
                 stdin,
                 stdout: tokio::io::BufReader::new(stdout),
             }),
+            server_capabilities: std::sync::OnceLock::new(),
         };
         upstream.initialize().await?;
         Ok(upstream)
@@ -1526,7 +1841,10 @@ impl StdioUpstream {
             "capabilities": self.opts.client_capabilities.clone(),
             "clientInfo": { "name": wire::CLIENT_NAME, "version": env!("CARGO_PKG_VERSION") },
         });
-        self.call("initialize", params, None, None).await?;
+        let result = self.call("initialize", params, None, None).await?;
+        if let Some(capabilities) = capabilities_of(Some(result)) {
+            let _ = self.server_capabilities.set(capabilities);
+        }
         self.notify("notifications/initialized").await
     }
 
@@ -1600,14 +1918,7 @@ impl StdioUpstream {
                 // Terminal response to our request.
                 (None, Some(resp_id)) if resp_id == &json!(id) => {
                     if let Some(err) = msg.get("error") {
-                        return Err(UpstreamError::JsonRpc {
-                            code: err.get("code").and_then(Value::as_i64).unwrap_or(-32603),
-                            message: err
-                                .get("message")
-                                .and_then(Value::as_str)
-                                .unwrap_or("upstream error")
-                                .to_owned(),
-                        });
+                        return Err(UpstreamError::from_error_value(err));
                     }
                     return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
                 }
@@ -1763,6 +2074,10 @@ impl McpUpstream for StdioUpstream {
         Ok(Box::pin(futures::stream::pending()))
     }
 
+    fn server_capabilities(&self) -> Option<&Value> {
+        self.server_capabilities.get()
+    }
+
     async fn close(&self) {
         let mut io = self.io.lock().await;
         let _ = io.child.start_kill();
@@ -1825,14 +2140,18 @@ pub async fn connect_upstream(
     }
 }
 
-/// Build a `reqwest::Client` whose DNS is pinned to a validated,
-/// non-private address — the same rebinding guard `net-core` applies to
-/// HTTP bindings. Pinning closes the TOCTOU window where an
+/// Build the `reqwest::Client`s for one upstream, their DNS pinned to a
+/// validated, non-private address — the same rebinding guard `net-core`
+/// applies to HTTP bindings. Pinning closes the TOCTOU window where an
 /// attacker-controlled record could flip to a private IP after the
 /// check.
-async fn build_guarded_client(
+///
+/// The first client bounds every request by `opts.timeout` end to end.
+/// The second serves long-lived streams: `opts.timeout` bounds only the
+/// connect, and the stream readers watch for silence instead.
+async fn build_guarded_clients(
     opts: &UpstreamConnectOptions,
-) -> Result<reqwest::Client, UpstreamError> {
+) -> Result<(reqwest::Client, reqwest::Client), UpstreamError> {
     let url = Url::parse(&opts.url)
         .map_err(|e| UpstreamError::Connect(format!("invalid url '{}': {e}", opts.url)))?;
     let host = url
@@ -1860,25 +2179,31 @@ async fn build_guarded_client(
         ))
     })?;
 
-    let mut builder = reqwest::Client::builder()
-        .timeout(opts.timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .resolve(&host, resolved);
     // A `tunnel://` upstream authenticates its org to the relay's federation
     // ingress with this header on every request. Set it as a client default so
     // POST / SSE / DELETE all carry it. The relay consumes it and does not
     // forward it, so it never reaches the tunnelled gateway.
+    let mut default_headers = reqwest::header::HeaderMap::new();
     if let Some(token) = &opts.tunnel_token {
-        let mut headers = reqwest::header::HeaderMap::new();
         let value = reqwest::header::HeaderValue::from_str(token).map_err(|_| {
             UpstreamError::Connect("tunnel token is not a valid HTTP header value".to_owned())
         })?;
-        headers.insert(TUNNEL_TOKEN_HEADER, value);
-        builder = builder.default_headers(headers);
+        default_headers.insert(TUNNEL_TOKEN_HEADER, value);
     }
-    builder
-        .build()
-        .map_err(|e| UpstreamError::Connect(format!("client build failed: {e}")))
+    let pinned = || {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve(&host, resolved)
+            .default_headers(default_headers.clone())
+    };
+    let build = |builder: reqwest::ClientBuilder| {
+        builder
+            .build()
+            .map_err(|e| UpstreamError::Connect(format!("client build failed: {e}")))
+    };
+    let client = build(pinned().timeout(opts.timeout))?;
+    let stream_client = build(pinned().connect_timeout(opts.timeout))?;
+    Ok((client, stream_client))
 }
 
 /// Relay-consumed org-authentication header for `tunnel://` federation
@@ -1930,6 +2255,7 @@ mod tests {
             tools_list_changed: true,
             prompts_list_changed: false,
             resources_list_changed: true,
+            events_list_changed: true,
         };
         let targets = spec.targets();
         assert_eq!(
@@ -1943,6 +2269,7 @@ mod tests {
                 },
                 SubscriptionTarget::ToolsListChanged,
                 SubscriptionTarget::ResourcesListChanged,
+                SubscriptionTarget::EventsListChanged,
             ]
         );
     }
@@ -2099,7 +2426,11 @@ mod tests {
                         "resultType": "discover",
                         "supportedVersions": ["2026-07-28"],
                         "serverInfo": { "name": "modern-mock", "version": "1" },
-                        "capabilities": { "tools": {} }
+                        "capabilities": {
+                            "tools": {},
+                            "events": {},
+                            "extensions": { "io.modelcontextprotocol/events": {} }
+                        }
                     }
                 }))
                 .into_response(),
@@ -2183,6 +2514,38 @@ mod tests {
             upstream.session_id.is_none(),
             "modern wire is stateless: no handshake, no session"
         );
+        // The discover result is kept verbatim, keys this build has no
+        // type for included, so a caller can see what the upstream offers.
+        let capabilities = upstream
+            .server_capabilities()
+            .expect("discover capabilities");
+        assert_eq!(capabilities["events"], json!({}));
+        assert_eq!(
+            capabilities["extensions"]["io.modelcontextprotocol/events"],
+            json!({})
+        );
+        assert_eq!(capabilities["tools"], json!({}));
+    }
+
+    #[tokio::test]
+    async fn a_pinned_modern_wire_exchanges_no_handshake_to_keep() {
+        let url = spawn_modern_mock().await;
+        let mut o = opts(url, true);
+        o.modern = true;
+        let upstream = StreamableHttpUpstream::connect(o).await.expect("connect");
+        assert!(upstream.server_capabilities().is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_initialize_capabilities_are_kept() {
+        let url = spawn_mock().await;
+        let upstream = StreamableHttpUpstream::connect(opts(url, true))
+            .await
+            .expect("connect");
+        assert_eq!(
+            upstream.server_capabilities(),
+            Some(&json!({ "tools": {} }))
+        );
     }
 
     #[tokio::test]
@@ -2196,6 +2559,11 @@ mod tests {
             .expect("probing connect against a legacy upstream");
         assert!(!upstream.wire_is_modern());
         assert_eq!(upstream.session_id.as_deref(), Some("sess-mock-1"));
+        assert_eq!(
+            upstream.server_capabilities(),
+            Some(&json!({ "tools": {} })),
+            "after a fallback the legacy handshake's capabilities are the ones kept"
+        );
     }
 
     #[tokio::test]
@@ -2269,12 +2637,146 @@ mod tests {
         let upstream = StdioUpstream::connect(opts)
             .await
             .expect("spawn + initialize stdio upstream");
+        assert_eq!(upstream.server_capabilities(), Some(&json!({})));
         let tools = upstream.list_tools().await.expect("list_tools");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "echo");
         let result = upstream.call_tool("echo", None).await.expect("call_tool");
         assert_eq!(result["content"][0]["text"], "stdio-ok");
         upstream.close().await;
+    }
+
+    /// A JSON-RPC error's `data` survives the stdio transport too.
+    #[tokio::test]
+    async fn stdio_errors_keep_their_data() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("mock-mcp.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+             read line\n\
+             printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"serverInfo\":{\"name\":\"m\",\"version\":\"1\"}}}'\n\
+             read line\n\
+             read line\n\
+             printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32011,\"message\":\"not found\",\"data\":{\"kind\":\"event\"}}}'\n",
+        )
+        .expect("write script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let mut o = opts(String::new(), true);
+        o.transport = crate::transport::UpstreamTransport::Stdio;
+        o.command = Some(script.to_string_lossy().into_owned());
+        let upstream = StdioUpstream::connect(o)
+            .await
+            .expect("spawn stdio upstream");
+        let error = upstream.call_tool("x", None).await.unwrap_err();
+        assert_eq!(error.jsonrpc_data(), Some(&json!({ "kind": "event" })));
+        upstream.close().await;
+    }
+
+    /// A JSON-RPC error's `data` reaches the caller over HTTP, on both the
+    /// plain-JSON path and the bridged path.
+    #[tokio::test]
+    async fn http_errors_keep_their_data() {
+        async fn handler(Json(body): Json<Value>) -> Response {
+            let method = body.get("method").and_then(Value::as_str).unwrap_or("");
+            let id = body.get("id").cloned();
+            match method {
+                "server/discover" => Json(json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": { "supportedVersions": ["2026-07-28"], "capabilities": {} }
+                }))
+                .into_response(),
+                _ => Json(json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": {
+                        "code": -32013,
+                        "message": "limit reached",
+                        "data": { "limit": "subscriptions", "max": 100 }
+                    }
+                }))
+                .into_response(),
+            }
+        }
+        let app = Router::new().route("/mcp", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let upstream = StreamableHttpUpstream::connect(probing_opts(format!("http://{addr}/mcp")))
+            .await
+            .expect("connect");
+        let expected = json!({ "limit": "subscriptions", "max": 100 });
+
+        let error = upstream.list_tools().await.unwrap_err();
+        match &error {
+            UpstreamError::JsonRpc { code, data, .. } => {
+                assert_eq!(*code, -32013);
+                assert_eq!(data.as_ref(), Some(&expected));
+            }
+            other => panic!("expected a JSON-RPC error, got {other:?}"),
+        }
+        assert!(
+            !error.to_string().contains("subscriptions"),
+            "the upstream's data stays out of the message: {error}"
+        );
+
+        let error = upstream
+            .call_tool_bridged("x", None, None, &NoBridge, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.jsonrpc_data(), Some(&expected));
+    }
+
+    /// A 2026-07-28 server answers an error with the status its code maps
+    /// to. The error rides along whole: code, message and data.
+    #[tokio::test]
+    async fn an_error_status_keeps_its_jsonrpc_error() {
+        async fn handler(Json(body): Json<Value>) -> Response {
+            let method = body.get("method").and_then(Value::as_str).unwrap_or("");
+            let id = body.get("id").cloned();
+            match method {
+                "server/discover" => Json(json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": { "supportedVersions": ["2026-07-28"], "capabilities": {} }
+                }))
+                .into_response(),
+                _ => (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": {
+                            "code": -32012,
+                            "message": "forbidden",
+                            "data": { "reason": "trust" }
+                        }
+                    })),
+                )
+                    .into_response(),
+            }
+        }
+        let app = Router::new().route("/mcp", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let upstream = StreamableHttpUpstream::connect(probing_opts(format!("http://{addr}/mcp")))
+            .await
+            .expect("connect");
+
+        let error = upstream.list_events().await.unwrap_err();
+        assert!(
+            matches!(error, UpstreamError::Http { status: 403, .. }),
+            "{error:?}"
+        );
+        assert_eq!(error.jsonrpc_code(), Some(-32012));
+        assert_eq!(error.jsonrpc_data(), Some(&json!({ "reason": "trust" })));
+        assert!(
+            !error.to_string().contains("trust"),
+            "the upstream's data stays out of the message: {error}"
+        );
     }
 
     // --- Modern (2026-07-28) federation-client EMIT (SEP-2243) ---
@@ -2493,5 +2995,149 @@ mod tests {
             call.body["params"].get("_meta").is_none(),
             "legacy request body carries no per-request _meta triple"
         );
+    }
+
+    const LIST_CHANGED_FRAME: &str =
+        "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n";
+
+    /// An SSE body. `Beats` sends an SSE comment every `every` and a
+    /// notification on every fourth tick, `beats` ticks in all. `Silent`
+    /// sends one notification and then nothing while holding the
+    /// connection open.
+    enum StreamScript {
+        Beats { beats: usize, every: Duration },
+        Silent,
+    }
+
+    fn sse_response(script: StreamScript) -> Response {
+        let stream = async_stream::stream! {
+            match script {
+                StreamScript::Beats { beats, every } => {
+                    for tick in 0..beats {
+                        tokio::time::sleep(every).await;
+                        let frame = if tick % 4 == 3 { LIST_CHANGED_FRAME } else { ": keep-alive\n\n" };
+                        yield Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(frame));
+                    }
+                }
+                StreamScript::Silent => {
+                    yield Ok(axum::body::Bytes::from(LIST_CHANGED_FRAME));
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+            }
+        };
+        let mut response = axum::body::Body::from_stream(stream).into_response();
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            "text/event-stream".parse().unwrap(),
+        );
+        response
+    }
+
+    /// Serves the legacy handshake, `subscriptions/listen` on POST and the
+    /// legacy notification stream on GET, both streams per `script`.
+    async fn spawn_stream_mock(script: fn() -> StreamScript) -> String {
+        let app = Router::new().route(
+            "/mcp",
+            post(move |Json(body): Json<Value>| async move {
+                let id = body.get("id").cloned();
+                match body.get("method").and_then(Value::as_str).unwrap_or("") {
+                    "subscriptions/listen" => sse_response(script()),
+                    "initialize" => Json(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": { "protocolVersion": "2025-11-25", "capabilities": {} }
+                    }))
+                    .into_response(),
+                    _ => StatusCode::ACCEPTED.into_response(),
+                }
+            })
+            .get(move || async move { sse_response(script()) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/mcp")
+    }
+
+    fn short_timeout_opts(url: String, modern: bool) -> UpstreamConnectOptions {
+        let mut o = opts(url, true);
+        o.modern = modern;
+        o.timeout = Duration::from_millis(300);
+        o
+    }
+
+    fn beating() -> StreamScript {
+        StreamScript::Beats {
+            beats: 32,
+            every: Duration::from_millis(50),
+        }
+    }
+
+    /// A stream that keeps beating outlives the per-call timeout: only
+    /// silence ends it. The stream runs about 1.6 s against a 300 ms
+    /// per-call timeout, so a total deadline would cut it after the first
+    /// notification at most.
+    #[tokio::test]
+    async fn a_beating_stream_outlives_the_call_timeout() {
+        use futures::StreamExt;
+        for modern in [true, false] {
+            let url = spawn_stream_mock(beating).await;
+            let upstream = StreamableHttpUpstream::connect(short_timeout_opts(url, modern))
+                .await
+                .expect("connect")
+                .with_stream_idle_timeout(Duration::from_millis(200));
+            let stream = upstream
+                .open_subscriptions(&SubscriptionSpec::all_list_changed())
+                .await
+                .expect("open stream");
+            let started = std::time::Instant::now();
+            let received: Vec<Value> =
+                tokio::time::timeout(Duration::from_secs(10), stream.collect())
+                    .await
+                    .expect("the stream ends when the upstream closes it");
+            assert_eq!(received.len(), 8, "modern={modern}: {received:?}");
+            assert!(
+                started.elapsed() > Duration::from_millis(1200),
+                "modern={modern}: the stream lived {:?}",
+                started.elapsed()
+            );
+            assert_eq!(received[0]["method"], "notifications/tools/list_changed");
+        }
+    }
+
+    /// A stream that goes silent ends after the idle timeout instead of
+    /// hanging until the connection dies.
+    #[tokio::test]
+    async fn a_silent_stream_ends_after_the_idle_timeout() {
+        use futures::StreamExt;
+        for modern in [true, false] {
+            let url = spawn_stream_mock(|| StreamScript::Silent).await;
+            let upstream = StreamableHttpUpstream::connect(short_timeout_opts(url, modern))
+                .await
+                .expect("connect")
+                .with_stream_idle_timeout(Duration::from_millis(200));
+            let mut stream = upstream
+                .open_subscriptions(&SubscriptionSpec::all_list_changed())
+                .await
+                .expect("open stream");
+            let first = stream.next().await.expect("the one notification");
+            assert_eq!(first["method"], "notifications/tools/list_changed");
+            let started = std::time::Instant::now();
+            let next = tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .expect("the idle watchdog ends the stream");
+            assert!(next.is_none(), "modern={modern}");
+            assert!(
+                started.elapsed() >= Duration::from_millis(200),
+                "modern={modern}: ended after {:?}",
+                started.elapsed()
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_idle_timeout_is_twice_the_heartbeat_ceiling() {
+        assert_eq!(DEFAULT_STREAM_IDLE_TIMEOUT, Duration::from_secs(60));
     }
 }
