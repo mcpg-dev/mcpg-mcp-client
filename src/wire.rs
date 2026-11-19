@@ -1,10 +1,10 @@
-//! MCP JSON-RPC *client* wire types for the federation upstream
-//! client.
+//! MCP JSON-RPC *client* wire types for the upstream client.
 //!
 //! These are the client side of MCP — MCPG sends requests and parses
-//! responses — distinct from the gateway's server-side wire types
-//! (`protocol/v_*`), which are direction-inverted. Kept lean: just
-//! what the client needs (`initialize`, `tools/list`, `tools/call`).
+//! responses — distinct from the server-side wire types in
+//! `mcpg-mcp-wire`, which are direction-inverted. Kept lean: the
+//! JSON-RPC envelope, the list results the client walks, and the
+//! response-body reader.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -12,31 +12,20 @@ use serde_json::Value;
 /// `clientInfo.name` MCPG advertises to upstreams.
 pub const CLIENT_NAME: &str = "mcpg-federation";
 
-/// Outbound JSON-RPC message. A request when `id` is `Some`, a
-/// notification when `None`.
+/// Outbound JSON-RPC request.
 #[derive(Debug, Serialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<u64>,
+    pub id: u64,
     pub method: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub params: Option<Value>,
+    pub params: Value,
 }
 
 impl JsonRpcRequest {
-    pub fn call(id: u64, method: &'static str, params: Option<Value>) -> Self {
+    pub fn call(id: u64, method: &'static str, params: Value) -> Self {
         Self {
             jsonrpc: "2.0",
-            id: Some(id),
-            method,
-            params,
-        }
-    }
-    pub fn notification(method: &'static str, params: Option<Value>) -> Self {
-        Self {
-            jsonrpc: "2.0",
-            id: None,
+            id,
             method,
             params,
         }
@@ -184,35 +173,43 @@ pub struct ListPromptsResult {
     pub next_cursor: Option<String>,
 }
 
-/// Extract the JSON-RPC response from a Streamable-HTTP body, which is
-/// either `application/json` (the object directly) or
-/// `text/event-stream` (one or more `data:` frames — we take the last
-/// frame carrying a `result` or `error`, i.e. the terminal response).
-///
-/// MCPG advertises no sampling/elicitation capability upstream here,
-/// so a well-behaved upstream emits only the terminal response on the
-/// call's stream.
-pub fn parse_jsonrpc_body(is_sse: bool, body: &str) -> Result<JsonRpcResponse, String> {
-    if !is_sse {
-        return serde_json::from_str(body).map_err(|e| format!("invalid JSON-RPC body: {e}"));
-    }
-    let mut terminal: Option<JsonRpcResponse> = None;
-    for raw in body.lines() {
-        let line = raw.trim_start();
-        let Some(data) = line.strip_prefix("data:") else {
+/// The JSON-RPC response of an `application/json` Streamable-HTTP body.
+pub fn parse_jsonrpc_body(body: &str) -> Result<JsonRpcResponse, String> {
+    serde_json::from_str(body).map_err(|e| format!("invalid JSON-RPC body: {e}"))
+}
+
+/// The end (exclusive) of the first complete SSE event in `buf` whose
+/// closing blank line ends at or after `from`. Events end with a blank
+/// line, in LF or CRLF form.
+pub fn sse_event_end(buf: &[u8], from: usize) -> Option<usize> {
+    (from.max(1)..buf.len()).find_map(|i| {
+        let blank_line = buf[i] == b'\n'
+            && (buf[i - 1] == b'\n' || (i >= 2 && buf[i - 1] == b'\r' && buf[i - 2] == b'\n'));
+        blank_line.then_some(i + 1)
+    })
+}
+
+/// The response to request `id` an SSE event carries: `None` for a
+/// notification, a server request, or a response to another id. The
+/// event's `data:` lines join into one JSON document.
+pub fn sse_response_frame(event: &[u8], id: u64) -> Option<JsonRpcResponse> {
+    let text = std::str::from_utf8(event).ok()?;
+    let mut data = String::new();
+    for line in text.lines() {
+        let Some(value) = line.strip_prefix("data:") else {
             continue;
         };
-        let data = data.trim();
-        if data.is_empty() {
-            continue;
+        if !data.is_empty() {
+            data.push('\n');
         }
-        if let Ok(resp) = serde_json::from_str::<JsonRpcResponse>(data)
-            && (resp.result.is_some() || resp.error.is_some())
-        {
-            terminal = Some(resp);
-        }
+        data.push_str(value.strip_prefix(' ').unwrap_or(value));
     }
-    terminal.ok_or_else(|| "no JSON-RPC response frame in SSE stream".to_owned())
+    let value: Value = serde_json::from_str(data.trim()).ok()?;
+    if value.get("method").is_some() || value.get("id").and_then(Value::as_u64) != Some(id) {
+        return None;
+    }
+    let response: JsonRpcResponse = serde_json::from_value(value).ok()?;
+    (response.result.is_some() || response.error.is_some()).then_some(response)
 }
 
 #[cfg(test)]
@@ -221,24 +218,19 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn request_serializes_call_and_notification() {
-        let call = JsonRpcRequest::call(7, "tools/list", Some(json!({"cursor": "c"})));
+    fn request_serializes_a_call() {
+        let call = JsonRpcRequest::call(7, "tools/list", json!({"cursor": "c"}));
         let v = serde_json::to_value(&call).unwrap();
         assert_eq!(v["jsonrpc"], "2.0");
         assert_eq!(v["id"], 7);
         assert_eq!(v["method"], "tools/list");
         assert_eq!(v["params"]["cursor"], "c");
-
-        let note = JsonRpcRequest::notification("notifications/initialized", None);
-        let v = serde_json::to_value(&note).unwrap();
-        assert!(v.get("id").is_none(), "notifications carry no id");
-        assert!(v.get("params").is_none());
     }
 
     #[test]
     fn parse_plain_json_result() {
         let body = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#;
-        let resp = parse_jsonrpc_body(false, body).unwrap();
+        let resp = parse_jsonrpc_body(body).unwrap();
         assert!(resp.result.is_some());
         assert!(resp.error.is_none());
     }
@@ -246,7 +238,7 @@ mod tests {
     #[test]
     fn parse_plain_json_error() {
         let body = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"no such method"}}"#;
-        let resp = parse_jsonrpc_body(false, body).unwrap();
+        let resp = parse_jsonrpc_body(body).unwrap();
         let err = resp.error.unwrap();
         assert_eq!(err.code, -32601);
         assert_eq!(err.message, "no such method");
@@ -256,37 +248,45 @@ mod tests {
     #[test]
     fn parse_error_keeps_data() {
         let body = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32013,"message":"limit reached","data":{"limit":"subscriptions","max":100}}}"#;
-        let err = parse_jsonrpc_body(false, body).unwrap().error.unwrap();
+        let err = parse_jsonrpc_body(body).unwrap().error.unwrap();
         assert_eq!(err.code, -32013);
         assert_eq!(
             err.data,
             Some(json!({ "limit": "subscriptions", "max": 100 }))
         );
 
-        let sse = "event: message\n\
-                   data: {\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32011,\"message\":\"x\",\"data\":{\"kind\":\"event\"}}}\n\n";
-        let err = parse_jsonrpc_body(true, sse).unwrap().error.unwrap();
+        let sse = b"event: message\n\
+                    data: {\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32011,\"message\":\"x\",\"data\":{\"kind\":\"event\"}}}\n\n";
+        let err = sse_response_frame(sse, 2).unwrap().error.unwrap();
         assert_eq!(err.data, Some(json!({ "kind": "event" })));
     }
 
     #[test]
-    fn parse_sse_takes_terminal_response_frame() {
-        // A progress/notification frame, then the terminal result frame.
-        let body = "event: message\n\
-                    data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\
-                    \n\
-                    event: message\n\
-                    data: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[]}}\n\
-                    \n";
-        let resp = parse_jsonrpc_body(true, body).unwrap();
-        assert!(resp.result.is_some());
+    fn an_sse_response_frame_answers_its_own_id() {
+        let progress = b"event: message\n\
+                         data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n";
+        assert!(sse_response_frame(progress, 3).is_none());
+        let answer = b"event: message\n\
+                       data: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[]}}\n\n";
+        assert!(sse_response_frame(answer, 3).unwrap().result.is_some());
+        assert!(
+            sse_response_frame(answer, 4).is_none(),
+            "a response to another id"
+        );
+        let split = b"data: {\"jsonrpc\":\"2.0\",\"id\":3,\r\ndata: \"result\":{}}\r\n\r\n";
+        assert!(sse_response_frame(split, 3).is_some(), "data lines join");
     }
 
     #[test]
-    fn parse_sse_without_response_frame_errors() {
-        let body = "event: message\n\
-                    data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n";
-        assert!(parse_jsonrpc_body(true, body).is_err());
+    fn an_sse_event_ends_at_a_blank_line() {
+        assert_eq!(sse_event_end(b"data: a\n\ndata: b\n\n", 0), Some(9));
+        assert_eq!(sse_event_end(b"data: a\r\n\r\nrest", 0), Some(11));
+        assert_eq!(sse_event_end(b"data: a\n", 0), None);
+        assert_eq!(
+            sse_event_end(b"data: a\n\ndata: b\n\n", 9),
+            Some(18),
+            "the search resumes past an event already taken"
+        );
     }
 
     #[test]

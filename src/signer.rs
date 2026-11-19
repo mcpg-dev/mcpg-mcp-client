@@ -20,7 +20,7 @@ pub struct SigningRequest<'a> {
     pub method: &'a str,
     pub url: &'a str,
     pub headers: &'a [(String, String)],
-    /// Request body, or `None` for bodyless methods (GET, DELETE).
+    /// Request body, or `None` for a request without one.
     pub body: Option<&'a [u8]>,
 }
 
