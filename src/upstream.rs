@@ -21,6 +21,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::FutureExt as _;
+use futures::future::BoxFuture;
 use serde_json::{Value, json};
 use url::Url;
 
@@ -38,6 +40,10 @@ use mcpg_plugin_backend_net_core::safe_dns;
 const PROTOCOL_VERSION: &str = SUPPORTED_PROTOCOL_VERSION;
 /// Loop-detection header. Set on every upstream request.
 const VIA_HEADER: &str = "mcpg-upstream-via";
+/// The notification that tells the upstream a request is cancelled.
+const METHOD_NOTIFICATION_CANCELLED: &str = "notifications/cancelled";
+/// The `reason` of the `notifications/cancelled` this client sends.
+const CANCELLED_REASON: &str = "the client cancelled the request";
 /// Defensive cap on imported tools from a single upstream.
 const MAX_IMPORTED_TOOLS: usize = 10_000;
 /// Defensive cap on the MCP Events types one `events/list` walk reads.
@@ -86,6 +92,20 @@ fn discover_params(client_capabilities: &Value) -> Value {
         "clientInfo": client_info(),
         "capabilities": client_capabilities,
     })
+}
+
+/// The `notifications/cancelled` frame for request `id`, with the `_meta`
+/// identity triple every message of this client carries.
+fn cancelled_notification(id: u64, client_capabilities: &Value) -> Value {
+    let mut params = serde_json::to_value(
+        mcpg_mcp_wire::shared::notifications::CancelledNotificationParams {
+            request_id: json!(id),
+            reason: Some(CANCELLED_REASON.to_owned()),
+        },
+    )
+    .unwrap_or_else(|_| json!({ "requestId": id }));
+    inject_request_meta(&mut params, client_capabilities);
+    json!({ "jsonrpc": "2.0", "method": METHOD_NOTIFICATION_CANCELLED, "params": params })
 }
 
 /// Merge the per-request `_meta` identity triple (SEP-2575) into a
@@ -497,6 +517,25 @@ pub trait McpUpstream: Send + Sync {
         options: &ToolCallOptions<'_>,
     ) -> Result<Value, UpstreamError>;
 
+    /// [`Self::call_tool_with`] that ends when `cancelled` resolves first:
+    /// the call stops being awaited, and the upstream gets
+    /// `notifications/cancelled` naming the call's request id once the
+    /// request went out. `Ok(None)` is a cancelled call. This default only
+    /// stops waiting; a transport that knows the request id overrides it.
+    async fn call_tool_cancellable(
+        &self,
+        name: &str,
+        arguments: Option<&Value>,
+        options: &ToolCallOptions<'_>,
+        cancelled: BoxFuture<'_, ()>,
+    ) -> Result<Option<Value>, UpstreamError> {
+        tokio::select! {
+            biased;
+            () = cancelled => Ok(None),
+            answer = self.call_tool_with(name, arguments, options) => answer.map(Some),
+        }
+    }
+
     /// Ask for argument completions (`completion/complete`).
     ///
     /// `reference` names what is being completed — a prompt or a resource
@@ -634,10 +673,21 @@ impl StreamableHttpUpstream {
         params: Option<Value>,
         input_schema: Option<&Value>,
     ) -> Result<Value, UpstreamError> {
+        self.request_as(self.next_id(), method, params, input_schema)
+            .await
+    }
+
+    /// [`Self::request`] under the JSON-RPC id `id`.
+    async fn request_as(
+        &self,
+        id: u64,
+        method: &'static str,
+        params: Option<Value>,
+        input_schema: Option<&Value>,
+    ) -> Result<Value, UpstreamError> {
         let mut params = params.unwrap_or_else(|| json!({}));
         inject_request_meta(&mut params, &self.opts.client_capabilities);
         let headers = routing_headers(method, &params, input_schema);
-        let id = self.next_id();
         let body = JsonRpcRequest::call(id, method, params);
         let resp = self.send_post(&self.client, &body, &headers).await?;
         let parsed = if is_event_stream(&resp) {
@@ -694,6 +744,79 @@ impl StreamableHttpUpstream {
         body: &B,
         routing_headers: &[(String, String)],
     ) -> Result<reqwest::Response, UpstreamError> {
+        let req = self.build_post(client, body, routing_headers)?;
+        let resp = req.send().await.map_err(|e| {
+            UpstreamError::Transport(format!("request to {} failed: {e}", self.opts.url))
+        })?;
+        let status = resp.status();
+        if !status.is_success() {
+            // The JSON-RPC error the body carries, whole: its `data` is what
+            // a caller tells one condition of a code from another by.
+            let error = match read_capped(resp, self.opts.max_response_bytes).await {
+                Ok(text) => {
+                    tap_frame(
+                        &self.opts.tap,
+                        FrameDirection::Received,
+                        FrameChannel::HttpResponse,
+                        text.as_bytes(),
+                    );
+                    serde_json::from_str::<Value>(&text)
+                        .ok()
+                        .and_then(|mut v| v.get_mut("error").map(Value::take))
+                        .and_then(|e| serde_json::from_value::<wire::JsonRpcError>(e).ok())
+                }
+                Err(_) => None,
+            };
+            return Err(UpstreamError::Http {
+                status: status.as_u16(),
+                error,
+            });
+        }
+        Ok(resp)
+    }
+
+    /// Send `notifications/cancelled` for request `id` on a task of its
+    /// own: the notification has no answer, and the caller does not wait
+    /// on this upstream any more. Delivery is best effort; an upstream that
+    /// never hears it finishes the request and its answer goes unread.
+    fn notify_cancelled(&self, id: u64) {
+        let body = cancelled_notification(id, &self.opts.client_capabilities);
+        let headers = routing_headers(METHOD_NOTIFICATION_CANCELLED, &body["params"], None);
+        let req = match self.build_post(&self.client, &body, &headers) {
+            Ok(req) => req,
+            Err(e) => {
+                tracing::debug!(error = %e, request_id = id, "cannot build notifications/cancelled");
+                return;
+            }
+        };
+        let url = self.opts.url.clone();
+        tokio::spawn(async move {
+            match req.send().await {
+                Ok(resp) if resp.status().is_success() => {}
+                Ok(resp) => tracing::debug!(
+                    status = resp.status().as_u16(),
+                    url = %url,
+                    request_id = id,
+                    "the upstream refused notifications/cancelled"
+                ),
+                Err(e) => tracing::debug!(
+                    error = %e,
+                    url = %url,
+                    request_id = id,
+                    "notifications/cancelled did not reach the upstream"
+                ),
+            }
+        });
+    }
+
+    /// A POST of `body` on `client` with every header the wire needs,
+    /// signed when a signer is configured. The tap sees the body here.
+    fn build_post<B: serde::Serialize + ?Sized>(
+        &self,
+        client: &reqwest::Client,
+        body: &B,
+        routing_headers: &[(String, String)],
+    ) -> Result<reqwest::RequestBuilder, UpstreamError> {
         let mut req = client
             .post(&self.opts.url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -751,34 +874,7 @@ impl StreamableHttpUpstream {
             FrameChannel::HttpRequest,
             &raw,
         );
-        let resp = req.body(raw).send().await.map_err(|e| {
-            UpstreamError::Transport(format!("request to {} failed: {e}", self.opts.url))
-        })?;
-        let status = resp.status();
-        if !status.is_success() {
-            // The JSON-RPC error the body carries, whole: its `data` is what
-            // a caller tells one condition of a code from another by.
-            let error = match read_capped(resp, self.opts.max_response_bytes).await {
-                Ok(text) => {
-                    tap_frame(
-                        &self.opts.tap,
-                        FrameDirection::Received,
-                        FrameChannel::HttpResponse,
-                        text.as_bytes(),
-                    );
-                    serde_json::from_str::<Value>(&text)
-                        .ok()
-                        .and_then(|mut v| v.get_mut("error").map(Value::take))
-                        .and_then(|e| serde_json::from_value::<wire::JsonRpcError>(e).ok())
-                }
-                Err(_) => None,
-            };
-            return Err(UpstreamError::Http {
-                status: status.as_u16(),
-                error,
-            });
-        }
-        Ok(resp)
+        Ok(req.body(raw))
     }
 
     /// Run the configured [`crate::signer::RequestSigner`] and return the
@@ -1120,6 +1216,35 @@ impl McpUpstream for StreamableHttpUpstream {
         .await
     }
 
+    async fn call_tool_cancellable(
+        &self,
+        name: &str,
+        arguments: Option<&Value>,
+        options: &ToolCallOptions<'_>,
+        mut cancelled: BoxFuture<'_, ()>,
+    ) -> Result<Option<Value>, UpstreamError> {
+        // Cancelled before the request goes out: there is nothing to tell
+        // the upstream.
+        if (&mut cancelled).now_or_never().is_some() {
+            return Ok(None);
+        }
+        let id = self.next_id();
+        let call = self.request_as(
+            id,
+            "tools/call",
+            Some(options.params(name, arguments)),
+            options.input_schema,
+        );
+        tokio::select! {
+            biased;
+            () = cancelled => {
+                self.notify_cancelled(id);
+                Ok(None)
+            }
+            answer = call => answer.map(Some),
+        }
+    }
+
     async fn complete(
         &self,
         reference: &Value,
@@ -1331,6 +1456,16 @@ impl StdioUpstream {
 
         let mut io = self.io.lock().await;
         write_line(&mut io.stdin, &request, &self.opts.tap).await?;
+        self.read_answer(&mut io, id, method).await
+    }
+
+    /// Read frames off the pipe until the response to request `id`.
+    async fn read_answer(
+        &self,
+        io: &mut StdioIo,
+        id: u64,
+        method: &'static str,
+    ) -> Result<Value, UpstreamError> {
         loop {
             let Some(line) = read_line(&mut io.stdout, self.opts.max_response_bytes).await? else {
                 return Err(UpstreamError::Transport(format!(
@@ -1427,6 +1562,45 @@ impl McpUpstream for StdioUpstream {
         // A pipe carries no routing headers, so `input_schema` has no use.
         self.call("tools/call", options.params(name, arguments))
             .await
+    }
+
+    async fn call_tool_cancellable(
+        &self,
+        name: &str,
+        arguments: Option<&Value>,
+        options: &ToolCallOptions<'_>,
+        mut cancelled: BoxFuture<'_, ()>,
+    ) -> Result<Option<Value>, UpstreamError> {
+        let mut params = options.params(name, arguments);
+        inject_request_meta(&mut params, &self.opts.client_capabilities);
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let request =
+            json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": params });
+
+        // While another call holds the pipe nothing is sent, so a cancel
+        // then has nothing to tell the child.
+        let mut io = tokio::select! {
+            biased;
+            () = &mut cancelled => return Ok(None),
+            io = self.io.lock() => io,
+        };
+        // A frame is written whole: a cancel waits for the write to finish.
+        write_line(&mut io.stdin, &request, &self.opts.tap).await?;
+        let answered = tokio::select! {
+            biased;
+            () = cancelled => None,
+            answer = self.read_answer(&mut io, id, "tools/call") => Some(answer),
+        };
+        match answered {
+            Some(answer) => answer.map(Some),
+            None => {
+                let notice = cancelled_notification(id, &self.opts.client_capabilities);
+                if let Err(e) = write_line(&mut io.stdin, &notice, &self.opts.tap).await {
+                    tracing::debug!(error = %e, request_id = id, "cannot send notifications/cancelled");
+                }
+                Ok(None)
+            }
+        }
     }
 
     async fn complete(
@@ -2621,5 +2795,156 @@ mod tests {
     #[test]
     fn the_default_idle_timeout_is_twice_the_heartbeat_ceiling() {
         assert_eq!(DEFAULT_STREAM_IDLE_TIMEOUT, Duration::from_secs(60));
+    }
+
+    /// What a mock upstream whose `tools/call` never answers received.
+    #[derive(Default)]
+    struct HeldCalls {
+        /// The JSON-RPC id of every `tools/call`.
+        calls: Mutex<Vec<Value>>,
+        /// Every `notifications/cancelled`, whole.
+        cancels: Mutex<Vec<Value>>,
+    }
+
+    /// A mock upstream that holds every `tools/call` open and records it,
+    /// and records every `notifications/cancelled`.
+    async fn spawn_holding_mock() -> (String, Arc<HeldCalls>) {
+        let seen = Arc::new(HeldCalls::default());
+        let state = Arc::clone(&seen);
+        let app = Router::new().route(
+            "/mcp",
+            post(move |Json(body): Json<Value>| {
+                let seen = Arc::clone(&state);
+                async move {
+                    match body["method"].as_str() {
+                        Some("tools/call") => {
+                            seen.calls.lock().unwrap().push(body["id"].clone());
+                            std::future::pending::<Response>().await
+                        }
+                        Some(METHOD_NOTIFICATION_CANCELLED) => {
+                            seen.cancels.lock().unwrap().push(body);
+                            StatusCode::ACCEPTED.into_response()
+                        }
+                        _ => mock_handler(Json(body)).await,
+                    }
+                }
+            }),
+        );
+        (serve(app).await, seen)
+    }
+
+    /// Poll `probe` until it yields, for at most five seconds.
+    async fn eventually<T>(mut probe: impl FnMut() -> Option<T>) -> T {
+        for _ in 0..100 {
+            if let Some(found) = probe() {
+                return found;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("not observed within five seconds");
+    }
+
+    /// A cancel while the call runs ends the wait at once, and the upstream
+    /// hears which request is no longer wanted.
+    #[tokio::test]
+    async fn a_cancelled_http_call_stops_and_tells_the_upstream() {
+        let (url, seen) = spawn_holding_mock().await;
+        let upstream = StreamableHttpUpstream::connect(opts(url, true))
+            .await
+            .expect("connect");
+        let options = ToolCallOptions::default();
+        let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
+        let call = upstream.call_tool_cancellable(
+            "slow",
+            None,
+            &options,
+            Box::pin(async {
+                let _ = cancelled.await;
+            }),
+        );
+        let cancel_once_called = async {
+            let call_id = eventually(|| seen.calls.lock().unwrap().first().cloned()).await;
+            let _ = cancel.send(());
+            call_id
+        };
+        let (answer, call_id) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(call, cancel_once_called)
+        })
+        .await
+        .expect("the cancel ends the call");
+        assert!(matches!(answer, Ok(None)), "{answer:?}");
+        let notice = eventually(|| seen.cancels.lock().unwrap().first().cloned()).await;
+        assert_eq!(notice["params"]["requestId"], call_id);
+        assert_eq!(notice["params"]["reason"], CANCELLED_REASON);
+        assert!(notice.get("id").is_none(), "a notification has no id");
+    }
+
+    /// A cancel that comes before the call sends neither the call nor a
+    /// notification.
+    #[tokio::test]
+    async fn a_call_cancelled_before_it_starts_sends_nothing() {
+        let (url, seen) = spawn_holding_mock().await;
+        let upstream = StreamableHttpUpstream::connect(opts(url, true))
+            .await
+            .expect("connect");
+        let answer = upstream
+            .call_tool_cancellable(
+                "slow",
+                None,
+                &ToolCallOptions::default(),
+                Box::pin(std::future::ready(())),
+            )
+            .await;
+        assert!(matches!(answer, Ok(None)), "{answer:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(seen.calls.lock().unwrap().is_empty());
+        assert!(seen.cancels.lock().unwrap().is_empty());
+    }
+
+    /// Over stdio the notice follows the call on the same pipe and names
+    /// the call's id.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancelled_stdio_call_tells_the_child() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (script, log) = stdio_script(
+            dir.path(),
+            &format!("next\n{STDIO_DISCOVER_REPLY}next\nnext\nnext\n"),
+        );
+        let upstream = StdioUpstream::connect(stdio_opts(script))
+            .await
+            .expect("spawn + discover stdio upstream");
+        let lines = || -> Vec<Value> {
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect()
+        };
+        let options = ToolCallOptions::default();
+        let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
+        let call = upstream.call_tool_cancellable(
+            "slow",
+            None,
+            &options,
+            Box::pin(async {
+                let _ = cancelled.await;
+            }),
+        );
+        let cancel_once_called = async {
+            let call = eventually(|| lines().get(1).cloned()).await;
+            let _ = cancel.send(());
+            call
+        };
+        let (answer, call) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(call, cancel_once_called)
+        })
+        .await
+        .expect("the cancel ends the call");
+        assert!(matches!(answer, Ok(None)), "{answer:?}");
+        assert_eq!(call["method"], "tools/call");
+        let notice = eventually(|| lines().get(2).cloned()).await;
+        assert_eq!(notice["method"], METHOD_NOTIFICATION_CANCELLED);
+        assert_eq!(notice["params"]["requestId"], call["id"]);
     }
 }
