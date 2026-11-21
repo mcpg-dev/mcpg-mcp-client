@@ -48,12 +48,22 @@ const CANCELLED_REASON: &str = "the client cancelled the request";
 const MAX_IMPORTED_TOOLS: usize = 10_000;
 /// Defensive cap on the MCP Events types one `events/list` walk reads.
 const MAX_LISTED_EVENT_TYPES: usize = 10_000;
-/// Silence after which a long-lived stream is closed for the caller to
-/// reopen: twice the heartbeat ceiling of an MCP Events push stream
-/// ([`events::MAX_STREAM_HEARTBEAT_MS`]), and four times the 15 s keep-alive
-/// mcpg's own SSE streams send.
-pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration =
-    Duration::from_millis(2 * events::MAX_STREAM_HEARTBEAT_MS);
+/// Silence after which a `subscriptions/listen` stream is closed for the
+/// caller to reopen: four times the 15 s keep-alive mcpg's own SSE streams
+/// send. An `events/stream` is held by its granted heartbeat instead
+/// ([`events_stream_silence`]).
+pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Silence after which an `events/stream` counts as dead:
+/// [`events::DEAD_STREAM_HEARTBEATS`] times the heartbeat interval the
+/// server granted, or [`events::DEFAULT_HEARTBEAT_MS`] before a grant.
+pub fn events_stream_silence(granted_heartbeat_ms: Option<u64>) -> Duration {
+    Duration::from_millis(granted_heartbeat_ms.unwrap_or(events::DEFAULT_HEARTBEAT_MS))
+        .saturating_mul(events::DEAD_STREAM_HEARTBEATS)
+}
+
+/// The JSON-RPC code of a `HeaderMismatch` refusal.
+const HEADER_MISMATCH_CODE: i64 = mcpg_mcp_wire::shared::error::HEADER_MISMATCH_CODE as i64;
 
 /// The `capabilities` object of a `server/discover` result, when it has one.
 fn capabilities_of(result: &Value) -> Option<Value> {
@@ -130,28 +140,28 @@ fn inject_request_meta(params: &mut Value, client_capabilities: &Value) {
 
 /// SEP-2243 routing headers for an id-bearing request: `Mcp-Method` (the
 /// JSON-RPC method, always), `Mcp-Name` (the tool name / resource uri /
-/// prompt name for `tools/call` / `resources/read` / `prompts/get`), and
-/// the `Mcp-Param-{Name}` param promotions for `tools/call` when an
-/// `inputSchema` is known. Non-ASCII `Mcp-Name` values use the
-/// `=?base64?…?=` sentinel.
+/// prompt name for `tools/call` / `resources/read` / `prompts/get`, the
+/// event name for the `events/*` methods that name one), and the
+/// `Mcp-Param-{Name}` param promotions for `tools/call` and those
+/// `events/*` methods when an `inputSchema` is known. Non-ASCII
+/// `Mcp-Name` values use the `=?base64?…?=` sentinel.
 fn routing_headers(
     method: &str,
     params: &Value,
     input_schema: Option<&Value>,
 ) -> Vec<(String, String)> {
-    use mcpg_mcp_wire::v_2026_07_28::wire::{METHOD_HEADER, NAME_HEADER, encode_header_value};
-    let mut headers = vec![(METHOD_HEADER.to_owned(), method.to_owned())];
-    let name = match method {
-        "tools/call" | "prompts/get" => params.get("name").and_then(Value::as_str),
-        "resources/read" => params.get("uri").and_then(Value::as_str),
-        _ => None,
+    use mcpg_mcp_wire::v_2026_07_28::wire::{
+        METHOD_HEADER, NAME_HEADER, encode_header_value, name_source_field,
     };
+    let mut headers = vec![(METHOD_HEADER.to_owned(), method.to_owned())];
+    let names_one = name_source_field(method).or_else(|| events::name_header_field(method));
+    let name = names_one.and_then(|field| params.get(field).and_then(Value::as_str));
     if let Some(name) = name {
         headers.push((NAME_HEADER.to_owned(), encode_header_value(name)));
     }
     // The server-side promoter, so the constraint + encoding rules are
     // identical in both directions.
-    if method == "tools/call"
+    if (method == "tools/call" || events::name_header_field(method).is_some())
         && let (Some(schema), Some(args)) = (input_schema, params.get("arguments"))
     {
         headers.extend(mcpg_mcp_wire::v_2026_07_28::wire::promote_param_headers(
@@ -557,10 +567,20 @@ pub trait McpUpstream: Send + Sync {
     ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Value> + Send>>, UpstreamError>;
 
     /// `events/list`, every page. MCP Events is served over HTTP only;
-    /// elsewhere [`UpstreamError::Unsupported`].
+    /// elsewhere [`UpstreamError::Unsupported`]. A type whose
+    /// `x-mcp-header` annotations break the transport's rules is left out,
+    /// with a warning. Each type listed is remembered as by
+    /// [`Self::remember_event_input_schema`].
     async fn list_events(&self) -> Result<Vec<events::EventDescriptor>, UpstreamError> {
         Err(UpstreamError::Unsupported(events::METHOD_LIST_EVENTS))
     }
+
+    /// Take `input_schema` as the current `inputSchema` of event type
+    /// `name`: the `events/*` requests that name the type mirror the
+    /// arguments it annotates into `Mcp-Param-{Name}` headers. A request
+    /// the upstream refuses with `HeaderMismatch` lists the types again
+    /// and is retried once with the schema listed then.
+    fn remember_event_input_schema(&self, _name: &str, _input_schema: &Value) {}
 
     /// `events/poll`.
     async fn poll_events(
@@ -570,9 +590,11 @@ pub trait McpUpstream: Send + Sync {
         Err(UpstreamError::Unsupported(events::METHOD_POLL_EVENTS))
     }
 
-    /// `events/stream`: the stream's notifications as they arrive. The
-    /// stream ends when the upstream closes it, or after the stream idle
-    /// timeout without a byte (a live stream heartbeats well inside it).
+    /// `events/stream`: the stream's notifications as they arrive. No
+    /// request timeout applies to it: the stream ends when the upstream
+    /// closes it, or once it is silent for three granted heartbeat
+    /// intervals ([`events_stream_silence`]), counted from
+    /// `notifications/events/active`.
     async fn open_event_stream(
         &self,
         _params: &events::StreamEventsParams,
@@ -606,6 +628,21 @@ pub trait McpUpstream: Send + Sync {
         None
     }
 
+    /// The URL of the upstream's MCP endpoint, for a transport that has
+    /// one.
+    fn endpoint_url(&self) -> Option<&str> {
+        None
+    }
+
+    /// The upstream's Server Card, read from `{endpoint}/server-card` on
+    /// the endpoint's own origin over HTTPS, never through a redirect:
+    /// the only card whose security-relevant extension information may be
+    /// relied on. `Ok(None)` when the endpoint is not `https` or serves no
+    /// card.
+    async fn server_card(&self) -> Result<Option<Value>, UpstreamError> {
+        Ok(None)
+    }
+
     async fn close(&self);
 }
 
@@ -616,9 +653,13 @@ pub struct StreamableHttpUpstream {
     /// The `server/discover` result's advertised `capabilities`.
     server_capabilities: Option<Value>,
     next_id: AtomicU64,
-    /// How long a long-lived stream may stay silent before it is closed
-    /// and the caller reconnects.
+    /// How long a `subscriptions/listen` stream may stay silent before it
+    /// is closed and the caller reconnects.
     stream_idle_timeout: Duration,
+    /// The `inputSchema` of each event type, by name, as last listed or
+    /// remembered: it decides the `Mcp-Param-{Name}` headers of the
+    /// `events/*` requests that name the type.
+    event_schemas: std::sync::Mutex<std::collections::HashMap<String, Value>>,
     /// The client for long-lived streams: same pinned address and
     /// redirect policy as `client`, but no total-request timeout, which
     /// would cut every stream at `opts.timeout`.
@@ -637,6 +678,7 @@ impl StreamableHttpUpstream {
             server_capabilities: None,
             next_id: AtomicU64::new(1),
             stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
+            event_schemas: std::sync::Mutex::default(),
             stream_client,
         };
         if !upstream.opts.discover {
@@ -727,11 +769,73 @@ impl StreamableHttpUpstream {
         P: serde::Serialize + ?Sized,
         R: serde::de::DeserializeOwned,
     {
+        self.typed_request_with(method, params, None).await
+    }
+
+    /// [`Self::typed_request`] whose `Mcp-Param-{Name}` headers follow
+    /// `input_schema`.
+    async fn typed_request_with<P, R>(
+        &self,
+        method: &'static str,
+        params: &P,
+        input_schema: Option<&Value>,
+    ) -> Result<R, UpstreamError>
+    where
+        P: serde::Serialize + ?Sized,
+        R: serde::de::DeserializeOwned,
+    {
         let params = serde_json::to_value(params)
             .map_err(|e| UpstreamError::Protocol(format!("{method} params serialize: {e}")))?;
-        let result = self.request(method, Some(params), None).await?;
+        let result = self.request(method, Some(params), input_schema).await?;
         serde_json::from_value(result)
             .map_err(|e| UpstreamError::Protocol(format!("{method} result: {e}")))
+    }
+
+    /// The `inputSchema` last listed or remembered for event type `name`.
+    fn event_schema(&self, name: &str) -> Option<Value> {
+        self.event_schemas
+            .lock()
+            .ok()
+            .and_then(|schemas| schemas.get(name).cloned())
+    }
+
+    /// The `inputSchema` of event type `name` as the upstream lists it
+    /// now. `None` when it no longer lists the type, or lists it with
+    /// annotations a client refuses.
+    async fn relisted_event_schema(&self, name: &str) -> Option<Value> {
+        let listed = McpUpstream::list_events(self).await.ok()?;
+        listed
+            .into_iter()
+            .find(|descriptor| descriptor.name == name)
+            .map(|descriptor| descriptor.input_schema)
+    }
+
+    /// An `events/*` request that names event type `name`. A
+    /// `HeaderMismatch` refusal lists the types again and retries once,
+    /// with the headers the current `inputSchema` calls for.
+    async fn event_request<P, R>(
+        &self,
+        method: &'static str,
+        name: &str,
+        params: &P,
+    ) -> Result<R, UpstreamError>
+    where
+        P: serde::Serialize + ?Sized,
+        R: serde::de::DeserializeOwned,
+    {
+        let schema = self.event_schema(name);
+        match self
+            .typed_request_with(method, params, schema.as_ref())
+            .await
+        {
+            Err(error) if error.jsonrpc_code() == Some(HEADER_MISMATCH_CODE) => {
+                match self.relisted_event_schema(name).await {
+                    Some(schema) => self.typed_request_with(method, params, Some(&schema)).await,
+                    None => Err(error),
+                }
+            }
+            other => other,
+        }
     }
 
     /// Build + send a POST on `client`, returning the validated response
@@ -904,18 +1008,25 @@ impl StreamableHttpUpstream {
 
     /// A long-lived request (`subscriptions/listen`, `events/stream`): its
     /// notifications as they arrive. A JSON answer instead of a stream is
-    /// the server refusing the request. Only the response head is bounded
-    /// by `opts.timeout`; the stream itself ends on the idle timeout.
+    /// the server refusing the request. `watch` bounds the wait for the
+    /// response head and the silence the stream may keep; `input_schema`
+    /// decides the `Mcp-Param-{Name}` headers.
     async fn open_stream_request(
         &self,
         method: &'static str,
         mut params: Value,
+        input_schema: Option<&Value>,
+        watch: StreamWatch,
     ) -> Result<impl futures::Stream<Item = Value> + Send + use<>, UpstreamError> {
         inject_request_meta(&mut params, &self.opts.client_capabilities);
-        let headers = routing_headers(method, &params, None);
+        let headers = routing_headers(method, &params, input_schema);
         let body = JsonRpcRequest::call(self.next_id(), method, params);
+        let head_timeout = match watch {
+            StreamWatch::Idle(_) => self.opts.timeout,
+            StreamWatch::EventsHeartbeat => events_stream_silence(None),
+        };
         let resp = tokio::time::timeout(
-            self.opts.timeout,
+            head_timeout,
             self.send_post(&self.stream_client, &body, &headers),
         )
         .await
@@ -942,10 +1053,39 @@ impl StreamableHttpUpstream {
         Ok(notification_stream(
             resp,
             self.opts.max_response_bytes,
-            self.stream_idle_timeout,
+            watch,
             self.opts.tap.clone(),
         ))
     }
+
+    /// Open an `events/stream` whose `Mcp-Param-{Name}` headers follow
+    /// `input_schema`.
+    async fn open_events_stream(
+        &self,
+        params: Value,
+        input_schema: Option<&Value>,
+    ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Value> + Send>>, UpstreamError> {
+        Ok(Box::pin(
+            self.open_stream_request(
+                events::METHOD_STREAM_EVENTS,
+                params,
+                input_schema,
+                StreamWatch::EventsHeartbeat,
+            )
+            .await?,
+        ))
+    }
+}
+
+/// How a long-lived stream is watched for a dead connection.
+#[derive(Debug, Clone, Copy)]
+enum StreamWatch {
+    /// Closed after this long without a byte.
+    Idle(Duration),
+    /// An `events/stream`: closed after [`events_stream_silence`] of the
+    /// heartbeat interval the last `notifications/events/active` granted,
+    /// and of the default interval before the first.
+    EventsHeartbeat,
 }
 
 /// Read a `text/event-stream` answer to request `id` event by event and
@@ -1009,17 +1149,21 @@ async fn read_sse_response(
 /// no `id`). A frame buffer that grows past 4× the response cap without a
 /// boundary aborts the stream (defensive against a non-framing upstream).
 ///
-/// The stream also ends when `idle` passes without a byte. Heartbeats and
-/// SSE comment keep-alives count as bytes, so a live stream never trips
-/// it, while a silently dead connection ends instead of hanging; either
-/// way the caller reconnects.
+/// The stream also ends when the silence `watch` allows passes without a
+/// byte. Heartbeats and SSE comment keep-alives count as bytes, so a live
+/// stream never trips it, while a silently dead connection ends instead of
+/// hanging; either way the caller reconnects.
 fn notification_stream(
     mut resp: reqwest::Response,
     max_response_bytes: u64,
-    idle: Duration,
+    watch: StreamWatch,
     tap: Option<crate::tap::SharedTap>,
 ) -> impl futures::Stream<Item = Value> + Send + use<> {
     let cap = max_response_bytes.saturating_mul(4);
+    let mut idle = match watch {
+        StreamWatch::Idle(idle) => idle,
+        StreamWatch::EventsHeartbeat => events_stream_silence(None),
+    };
     async_stream::stream! {
         // `Response::chunk` streams the body without needing reqwest's
         // `stream` feature.
@@ -1051,6 +1195,16 @@ fn notification_stream(
                         && val.get("method").is_some()
                         && val.get("id").is_none()
                     {
+                        if matches!(watch, StreamWatch::EventsHeartbeat)
+                            && val.get("method").and_then(Value::as_str)
+                                == Some(events::METHOD_NOTIFICATIONS_ACTIVE)
+                        {
+                            idle = events_stream_silence(
+                                val.get("params")
+                                    .and_then(|p| p.get("heartbeatMs"))
+                                    .and_then(Value::as_u64),
+                            );
+                        }
                         yield val;
                     }
                 }
@@ -1280,8 +1434,13 @@ impl McpUpstream for StreamableHttpUpstream {
         let params = serde_json::to_value(&params)
             .map_err(|e| UpstreamError::Protocol(format!("listen params serialize: {e}")))?;
         Ok(Box::pin(
-            self.open_stream_request(METHOD_SUBSCRIPTIONS_LISTEN, params)
-                .await?,
+            self.open_stream_request(
+                METHOD_SUBSCRIPTIONS_LISTEN,
+                params,
+                None,
+                StreamWatch::Idle(self.stream_idle_timeout),
+            )
+            .await?,
         ))
     }
 
@@ -1308,8 +1467,37 @@ impl McpUpstream for StreamableHttpUpstream {
                 Some(next) if !next.is_empty() && cursor.as_deref() != Some(next.as_str()) => {
                     cursor = Some(next);
                 }
-                _ => return Ok(all),
+                _ => break,
             }
+        }
+        all.retain(|descriptor| {
+            match mcpg_mcp_wire::v_2026_07_28::wire::x_mcp_header_violation(
+                &descriptor.input_schema,
+            ) {
+                None => true,
+                Some(violation) => {
+                    tracing::warn!(
+                        url = %self.opts.url,
+                        event = %descriptor.name,
+                        reason = %violation,
+                        "the upstream's event type is left out: its x-mcp-header annotations break the transport's rules"
+                    );
+                    false
+                }
+            }
+        });
+        if let Ok(mut schemas) = self.event_schemas.lock() {
+            *schemas = all
+                .iter()
+                .map(|descriptor| (descriptor.name.clone(), descriptor.input_schema.clone()))
+                .collect();
+        }
+        Ok(all)
+    }
+
+    fn remember_event_input_schema(&self, name: &str, input_schema: &Value) {
+        if let Ok(mut schemas) = self.event_schemas.lock() {
+            schemas.insert(name.to_owned(), input_schema.clone());
         }
     }
 
@@ -1317,26 +1505,36 @@ impl McpUpstream for StreamableHttpUpstream {
         &self,
         params: &events::PollEventsParams,
     ) -> Result<events::PollEventsResult, UpstreamError> {
-        self.typed_request(events::METHOD_POLL_EVENTS, params).await
+        self.event_request(events::METHOD_POLL_EVENTS, &params.name, params)
+            .await
     }
 
     async fn open_event_stream(
         &self,
         params: &events::StreamEventsParams,
     ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Value> + Send>>, UpstreamError> {
-        let params = serde_json::to_value(params)
+        let value = serde_json::to_value(params)
             .map_err(|e| UpstreamError::Protocol(format!("events/stream params serialize: {e}")))?;
-        Ok(Box::pin(
-            self.open_stream_request(events::METHOD_STREAM_EVENTS, params)
-                .await?,
-        ))
+        let schema = self.event_schema(&params.name);
+        match self
+            .open_events_stream(value.clone(), schema.as_ref())
+            .await
+        {
+            Err(error) if error.jsonrpc_code() == Some(HEADER_MISMATCH_CODE) => {
+                match self.relisted_event_schema(&params.name).await {
+                    Some(schema) => self.open_events_stream(value, Some(&schema)).await,
+                    None => Err(error),
+                }
+            }
+            other => other,
+        }
     }
 
     async fn subscribe_events(
         &self,
         params: &events::SubscribeEventsParams,
     ) -> Result<events::SubscribeEventsResult, UpstreamError> {
-        self.typed_request(events::METHOD_SUBSCRIBE_EVENTS, params)
+        self.event_request(events::METHOD_SUBSCRIBE_EVENTS, &params.name, params)
             .await
     }
 
@@ -1344,12 +1542,40 @@ impl McpUpstream for StreamableHttpUpstream {
         &self,
         params: &events::UnsubscribeEventsParams,
     ) -> Result<events::UnsubscribeEventsResult, UpstreamError> {
-        self.typed_request(events::METHOD_UNSUBSCRIBE_EVENTS, params)
+        self.event_request(events::METHOD_UNSUBSCRIBE_EVENTS, &params.name, params)
             .await
     }
 
     fn server_capabilities(&self) -> Option<&Value> {
         self.server_capabilities.as_ref()
+    }
+
+    fn endpoint_url(&self) -> Option<&str> {
+        Some(&self.opts.url)
+    }
+
+    async fn server_card(&self) -> Result<Option<Value>, UpstreamError> {
+        if !self.opts.url.starts_with("https://") {
+            return Ok(None);
+        }
+        let url = format!("{}/server-card", self.opts.url.trim_end_matches('/'));
+        // `client` is pinned to the endpoint's vetted address and follows
+        // no redirect, so the card comes from the endpoint's own origin.
+        let resp = self
+            .client
+            .get(&url)
+            .header(reqwest::header::ACCEPT, "application/mcp-server-card+json")
+            .header(VIA_HEADER, &self.opts.gateway_via)
+            .send()
+            .await
+            .map_err(|e| UpstreamError::Transport(format!("server card from {url}: {e}")))?;
+        if !resp.status().is_success() {
+            return Ok(None);
+        }
+        let text = read_capped(resp, self.opts.max_response_bytes).await?;
+        Ok(serde_json::from_str::<Value>(&text)
+            .ok()
+            .filter(Value::is_object))
     }
 
     /// Stateless: there is nothing to tear down.
@@ -2478,6 +2704,157 @@ mod tests {
         );
     }
 
+    /// A mock events server: it lists `orders.created`, which annotates
+    /// `region` as `Mcp-Param-Region`, and `bad.type`, whose annotation
+    /// breaks the rules. A poll without the right routing headers draws
+    /// HTTP 400 `HeaderMismatch`.
+    async fn spawn_events_mock(capture: Capture) -> String {
+        async fn handler(
+            axum::extract::State(capture): axum::extract::State<Capture>,
+            headers: axum::http::HeaderMap,
+            Json(body): Json<Value>,
+        ) -> Response {
+            capture.lock().unwrap().push(Captured {
+                headers: headers.clone(),
+                body: body.clone(),
+            });
+            let id = body.get("id").cloned();
+            let result = match body.get("method").and_then(Value::as_str) {
+                Some("server/discover") => discover_result(json!({})),
+                Some("events/list") => json!({
+                    "resultType": "complete",
+                    "events": [
+                        {
+                            "name": "orders.created",
+                            "delivery": ["poll"],
+                            "inputSchema": { "type": "object", "properties": {
+                                "region": { "type": "string", "x-mcp-header": "Region" }
+                            } },
+                            "payloadSchema": { "type": "object" }
+                        },
+                        {
+                            "name": "bad.type",
+                            "delivery": ["poll"],
+                            "inputSchema": { "type": "object", "properties": {
+                                "ratio": { "type": "number", "x-mcp-header": "Ratio" }
+                            } },
+                            "payloadSchema": { "type": "object" }
+                        }
+                    ]
+                }),
+                Some("events/poll") => {
+                    let named = headers.get("mcp-name").and_then(|v| v.to_str().ok())
+                        == body["params"]["name"].as_str();
+                    let region = headers
+                        .get("mcp-param-region")
+                        .and_then(|v| v.to_str().ok())
+                        == body["params"]["arguments"]["region"].as_str();
+                    if !(named && region) {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": { "code": -32020, "message": "HeaderMismatch" }
+                            })),
+                        )
+                            .into_response();
+                    }
+                    json!({
+                        "resultType": "complete", "events": [], "cursor": "c1",
+                        "truncated": false, "hasMore": false, "nextPollMs": 1000
+                    })
+                }
+                _ => json!({}),
+            };
+            Json(json!({ "jsonrpc": "2.0", "id": id, "result": result })).into_response()
+        }
+        serve(
+            Router::new()
+                .route("/mcp", post(handler))
+                .with_state(capture),
+        )
+        .await
+    }
+
+    fn poll_orders() -> events::PollEventsParams {
+        serde_json::from_value(json!({
+            "name": "orders.created",
+            "arguments": { "region": "eu" },
+            "cursor": null
+        }))
+        .unwrap()
+    }
+
+    /// A type whose annotations break the rules is not listed, and the
+    /// listed schema puts `Mcp-Name` and `Mcp-Param-Region` on a poll.
+    #[tokio::test]
+    async fn events_requests_carry_the_routing_headers_their_schema_calls_for() {
+        let capture: Capture = Arc::new(Mutex::new(Vec::new()));
+        let url = spawn_events_mock(Arc::clone(&capture)).await;
+        let upstream = StreamableHttpUpstream::connect(opts(url, true))
+            .await
+            .expect("connect");
+        let listed = upstream.list_events().await.expect("events/list");
+        let names: Vec<&str> = listed.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["orders.created"]);
+
+        let polled = upstream.poll_events(&poll_orders()).await.expect("poll");
+        assert_eq!(polled.cursor.as_deref(), Some("c1"));
+        let posts = capture.lock().unwrap();
+        let poll = posts.last().unwrap();
+        assert_eq!(header(poll, "mcp-method"), Some("events/poll"));
+        assert_eq!(header(poll, "mcp-name"), Some("orders.created"));
+        assert_eq!(header(poll, "mcp-param-region"), Some("eu"));
+        let list = posts
+            .iter()
+            .find(|p| p.body["method"] == "events/list")
+            .unwrap();
+        assert_eq!(header(list, "mcp-name"), None, "events/list names no type");
+    }
+
+    /// Without a known schema the poll goes out without `Mcp-Param-*`; the
+    /// `HeaderMismatch` it draws makes the client list again and retry
+    /// once, with the header.
+    #[tokio::test]
+    async fn a_header_mismatch_lists_again_and_retries_once() {
+        let capture: Capture = Arc::new(Mutex::new(Vec::new()));
+        let url = spawn_events_mock(Arc::clone(&capture)).await;
+        let upstream = StreamableHttpUpstream::connect(opts(url, true))
+            .await
+            .expect("connect");
+        let polled = upstream.poll_events(&poll_orders()).await.expect("poll");
+        assert_eq!(polled.cursor.as_deref(), Some("c1"));
+        let methods: Vec<String> = capture
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| p.body["method"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            methods,
+            [
+                "server/discover",
+                "events/poll",
+                "events/list",
+                "events/poll"
+            ]
+        );
+
+        // A type the upstream does not list cannot be repaired: the
+        // refusal stands after one listing.
+        let mut unknown = poll_orders();
+        unknown.name = "orders.deleted".to_owned();
+        let error = upstream.poll_events(&unknown).await.unwrap_err();
+        assert_eq!(error.jsonrpc_code(), Some(-32020));
+    }
+
+    #[test]
+    fn an_events_stream_is_dead_after_three_granted_heartbeats() {
+        assert_eq!(events_stream_silence(None), Duration::from_secs(90));
+        assert_eq!(events_stream_silence(Some(15_000)), Duration::from_secs(45));
+    }
+
     /// The retry of a suspended call carries `requestState` and
     /// `inputResponses` beside `name` and `arguments`, never under `_meta`.
     #[tokio::test]
@@ -2793,7 +3170,7 @@ mod tests {
     }
 
     #[test]
-    fn the_default_idle_timeout_is_twice_the_heartbeat_ceiling() {
+    fn the_default_idle_timeout_is_four_keep_alives() {
         assert_eq!(DEFAULT_STREAM_IDLE_TIMEOUT, Duration::from_secs(60));
     }
 
